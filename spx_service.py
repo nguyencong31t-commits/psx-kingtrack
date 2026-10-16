@@ -29,10 +29,12 @@ HEADERS = {
 }
 
 DELIVERY_COMPLETE_KEYWORDS = [
-    "delivered", "giao hàng thành công", "đã giao", "giao thành công", "ký nhận", "đã nhận hàng"
+    "delivered", "delivery_done", "giao hàng thành công", "đã giao", "giao thành công", 
+    "ký nhận", "đã nhận hàng", "received by consignee", "buyer received"
 ]
 CANCELLED_KEYWORDS = [
-    "cancelled", "đã hủy", "hủy đơn", "trả hàng thành công", "chuyển hoàn thành công", "đã hoàn hàng"
+    "cancelled", "canceled", "đã hủy", "hủy đơn", "trả hàng thành công", 
+    "chuyển hoàn thành công", "đã hoàn hàng", "return_done", "returned"
 ]
 
 from datetime import datetime, timezone, timedelta

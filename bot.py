@@ -129,7 +129,20 @@ async def process_tracking_request(update: Update, tracking_number: str, label: 
         )
         return
 
-    # Lưu vào CSDL
+    latest_event = info.get("latest_event") or {}
+    card = format_spx_card(info["tracking_number"], label, latest_event)
+
+    # Nếu đơn hàng đã giao thành công hoặc đã hủy: Không lưu vào theo dõi (tự động untrack)
+    if info.get("is_completed"):
+        await remove_tracking(chat_id, info["tracking_number"])
+        if info.get("is_delivered"):
+            card += "\n\n🎉 ĐƠN HÀNG ĐÃ GIAO THÀNH CÔNG!\n✅ Đơn hàng đã hoàn tất nên bot không cần theo dõi nữa."
+        else:
+            card += "\n\n⚠️ ĐƠN HÀNG ĐÃ BỊ HỦY HOẶC CHUYỂN HOÀN!\n✅ Đơn hàng đã kết thúc nên bot không cần theo dõi nữa."
+        await status_msg.edit_text(card)
+        return
+
+    # Lưu vào CSDL cho các đơn đang trên đường vận chuyển
     await add_or_update_tracking(
         chat_id=chat_id,
         tracking_number=info["tracking_number"],
@@ -138,13 +151,7 @@ async def process_tracking_request(update: Update, tracking_number: str, label: 
         timestamp=info["timestamp"]
     )
 
-    latest_event = info.get("latest_event") or {}
-    card = format_spx_card(info["tracking_number"], label, latest_event)
     card += "\n\n🔔 Bot đã bật tự động theo dõi cho đơn hàng này!"
-
-    if info["is_completed"]:
-        card += "\n\n🎉 Đơn hàng này hiện đã ở trạng thái GIAO THÀNH CÔNG!"
-
     await status_msg.edit_text(card)
 
 async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -291,31 +298,44 @@ async def poll_spx_updates_job(context: ContextTypes.DEFAULT_TYPE):
         last_time = row["last_timestamp"]
 
         info = await loop.run_in_executor(None, fetch_spx_tracking, code)
+        if not info:
+            continue
+
+        is_done = bool(info.get("is_completed"))
+        has_new_event = info.get("timestamp", 0) > last_time
 
         # Phát hiện sự kiện mới (timestamp mới hơn mốc đã lưu)
-        if info and info["timestamp"] > last_time:
+        if has_new_event:
             latest_event = info.get("latest_event") or {}
             card = format_spx_card(code, label, latest_event)
 
-            is_done = info["is_completed"]
             if is_done:
-                if info["is_delivered"]:
-                    card += "\n\n🎉 ĐƠN HÀNG ĐÃ GIAO THÀNH CÔNG!\nBot tự động hoàn tất và ngừng theo dõi đơn này."
-                elif info["is_cancelled"]:
-                    card += "\n\n⚠️ ĐƠN HÀNG ĐÃ BỊ HỦY HOẶC CHUYỂN HOÀN!\nBot tự động ngừng theo dõi đơn này."
+                if info.get("is_delivered"):
+                    card += "\n\n🎉 ĐƠN HÀNG ĐÃ GIAO THÀNH CÔNG!\n✅ Bot đã tự động hoàn tất và ngừng theo dõi (untrack) đơn này."
+                elif info.get("is_cancelled"):
+                    card += "\n\n⚠️ ĐƠN HÀNG ĐÃ BỊ HỦY HOẶC CHUYỂN HOÀN!\n✅ Bot đã tự động ngừng theo dõi (untrack) đơn này."
 
             try:
                 await context.bot.send_message(chat_id=chat_id, text=card)
             except Exception as e:
                 logger.error(f"Lỗi gửi tin nhắn đến chat_id {chat_id}: {e}")
 
-            # Cập nhật mốc mới vào database
-            await update_tracking_status(
-                tracking_id=order_id,
-                status=info["latest_status"],
-                timestamp=info["timestamp"],
-                is_completed=is_done
-            )
+            if is_done:
+                # Tự động untrack: Xóa khỏi danh sách theo dõi khi giao thành công/hủy
+                await remove_tracking(chat_id, code)
+                logger.info(f"Đã tự động untrack đơn hoàn tất: {code} (chat_id: {chat_id})")
+            else:
+                # Cập nhật mốc mới vào database nếu đơn vẫn đang trên đường giao
+                await update_tracking_status(
+                    tracking_id=order_id,
+                    status=info["latest_status"],
+                    timestamp=info["timestamp"],
+                    is_completed=0
+                )
+        elif is_done:
+            # Đơn đã giao thành công từ trước: tự động dọn dẹp untrack khỏi CSDL
+            await remove_tracking(chat_id, code)
+            logger.info(f"Đã tự động dọn dẹp (untrack) đơn hoàn tất: {code} (chat_id: {chat_id})")
 
         # Nghỉ 2 giây giữa các request để giữ an toàn cho IP
         await asyncio.sleep(2.0)
