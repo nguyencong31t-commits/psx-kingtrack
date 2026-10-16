@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import re
+import html
 import logging
 
 if sys.platform == "win32":
@@ -29,7 +30,7 @@ from database import (
     get_all_active_trackings,
     update_tracking_status,
 )
-from spx_service import fetch_spx_tracking, format_timestamp, format_spx_card
+from spx_service import fetch_spx_tracking, format_timestamp, format_spx_card, translate_spx_status
 
 # Tải biến môi trường
 load_dotenv()
@@ -183,47 +184,66 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lệnh /list liệt kê các đơn đang chờ giao."""
-    chat_id = update.effective_chat.id
-    rows = await get_active_trackings_by_chat(chat_id)
+    try:
+        chat_id = update.effective_chat.id
+        rows = await get_active_trackings_by_chat(chat_id)
 
-    if not rows:
-        await update.message.reply_text(
-            "📭 Hiện tại bạn không có đơn hàng nào đang theo dõi.\n"
-            "👉 Hãy gửi mã vận đơn `SPXVN...` để thêm đơn nhé!",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
+        if not rows:
+            await update.message.reply_text(
+                "📭 Hiện tại bạn không có đơn hàng nào đang theo dõi.\n"
+                "👉 Hãy gửi mã vận đơn <code>SPXVN...</code> để thêm đơn nhé!",
+                parse_mode=ParseMode.HTML
+            )
+            return
 
-    lines = [f"📋 *DANH SÁCH ĐƠN ĐANG THEO DÕI ({len(rows)} đơn):*\n"]
-    for idx, r in enumerate(rows, 1):
-        t_str = format_timestamp(r["last_timestamp"])
-        lbl = r["label"]
-        label_part = f" ({lbl})" if lbl and lbl.lower() not in ("đơn hàng spx", "đơn spx", "") else ""
-        lines.append(
-            f"*{idx}.* `{r['tracking_number']}`{label_part}\n"
-            f"   📊 Trạng thái: _{r['last_status']}_\n"
-            f"   🕒 Cập nhật: {t_str}\n"
-        )
-    lines.append("👉 Dùng `/untrack <mã>` nếu muốn hủy theo dõi đơn nào.")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        lines = [f"📋 <b>DANH SÁCH ĐƠN ĐANG THEO DÕI ({len(rows)} đơn):</b>\n"]
+        for idx, r in enumerate(rows, 1):
+            t_str = format_timestamp(r["last_timestamp"])
+            lbl = (r["label"] or "").strip()
+            lbl_escaped = html.escape(lbl)
+            label_part = f" ({lbl_escaped})" if lbl_escaped and lbl_escaped.lower() not in ("đơn hàng spx", "đơn spx", "none", "") else ""
+            status_text = html.escape(translate_spx_status(r["last_status"] or ""))
+            code_escaped = html.escape(r["tracking_number"])
+            lines.append(
+                f"<b>{idx}.</b> <code>{code_escaped}</code>{label_part}\n"
+                f"   📌 Trạng thái: {status_text}\n"
+                f"   🕒 Cập nhật: {t_str}\n"
+            )
+        lines.append("👉 Dùng <code>/untrack &lt;mã&gt;</code> nếu muốn hủy theo dõi đơn nào.")
+        full_text = "\n".join(lines)
+
+        try:
+            await update.message.reply_text(full_text, parse_mode=ParseMode.HTML)
+        except Exception as send_err:
+            logger.warning(f"Lỗi gửi HTML trong /list ({send_err}), fallback sang text thường")
+            clean_text = re.sub(r'<[^>]+>', '', full_text).replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+            await update.message.reply_text(clean_text)
+    except Exception as e:
+        logger.error(f"Lỗi list_command: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Có lỗi xảy ra khi lấy danh sách đơn. Vui lòng thử lại sau!")
 
 async def untrack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lệnh /untrack <mã>."""
-    chat_id = update.effective_chat.id
-    if not context.args:
-        await update.message.reply_text(
-            "⚠️ Vui lòng nhập mã vận đơn muốn dừng theo dõi!\n"
-            "Ví dụ: `/untrack SPXVN045388374941`",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
+    try:
+        chat_id = update.effective_chat.id
+        if not context.args:
+            await update.message.reply_text(
+                "⚠️ Vui lòng nhập mã vận đơn muốn dừng theo dõi!\n"
+                "Ví dụ: <code>/untrack SPXVN045388374941</code>",
+                parse_mode=ParseMode.HTML
+            )
+            return
 
-    code = context.args[0].strip().upper()
-    success = await remove_tracking(chat_id, code)
-    if success:
-        await update.message.reply_text(f"🗑 Đã dừng theo dõi đơn `{code}` thành công.", parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(f"❓ Không tìm thấy mã `{code}` trong danh sách theo dõi của bạn.", parse_mode=ParseMode.MARKDOWN)
+        code = context.args[0].strip().upper()
+        success = await remove_tracking(chat_id, code)
+        code_escaped = html.escape(code)
+        if success:
+            await update.message.reply_text(f"🗑 Đã dừng theo dõi đơn <code>{code_escaped}</code> thành công.", parse_mode=ParseMode.HTML)
+        else:
+            await update.message.reply_text(f"❓ Không tìm thấy mã <code>{code_escaped}</code> trong danh sách theo dõi của bạn.", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"Lỗi untrack_command: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Đã xảy ra lỗi khi hủy theo dõi. Vui lòng thử lại sau.")
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -313,6 +333,15 @@ async def post_init(application: Application):
     await application.bot.set_my_commands(commands)
     logger.info("Đã tự động đăng ký danh sách menu lệnh với Telegram thành công!")
 
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bắt và log toàn bộ exception chưa được xử lý để tránh bot bị câm lặng."""
+    logger.error("Exception khi xử lý update:", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text("⚠️ Đã có lỗi xảy ra khi xử lý yêu cầu. Vui lòng thử lại sau!")
+        except Exception:
+            pass
+
 def main():
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
         print("\n" + "=" * 60)
@@ -326,6 +355,9 @@ def main():
 
     # Khởi tạo ứng dụng Telegram Bot kèm JobQueue và menu lệnh
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    # Đăng ký xử lý lỗi toàn cục
+    app.add_error_handler(global_error_handler)
 
     # Đăng ký các bộ xử lý lệnh
     app.add_handler(CommandHandler(["start", "help"], start_command))

@@ -55,6 +55,32 @@ def generate_signed_tracking_number(tracking_number: str) -> str:
     sig = hashlib.sha256(signature_raw.encode("utf-8")).hexdigest()
     return f"{code}|{ts}{sig}"
 
+def translate_spx_status(raw_status: str, msg: str = "", loc: str = "") -> str:
+    """Chuyển đổi trạng thái mã code của SPX sang tiếng Việt chuẩn và dễ hiểu."""
+    if not raw_status and not msg:
+        return "Đang vận chuyển"
+    raw_status = str(raw_status or "")
+    if raw_status in ("FMHub_Pickup_Done", "Picked Up"):
+        return "Đơn vị vận chuyển lấy hàng thành công"
+    elif "Received" in raw_status:
+        return f"Đơn hàng đã đến kho {loc}" if loc else "Đơn hàng đã đến kho"
+    elif "Sorting" in raw_status:
+        return "Đơn hàng đã được phân loại và sẵn sàng trung chuyển đến điểm kế tiếp"
+    elif "Transporting" in raw_status or "LHTransporting" in raw_status:
+        return "Đơn hàng đã lên xe trung chuyển"
+    elif "Unloading" in raw_status or "Unloaded" in raw_status:
+        return "Đơn hàng đã được phân loại và sẵn sàng trung chuyển đến điểm kế tiếp"
+    elif raw_status in ("Delivering", "Out for Delivery"):
+        return "Đơn hàng đang được giao đến bạn"
+    elif raw_status in ("Delivered", "Delivery_Done"):
+        return "Đơn hàng đã giao thành công"
+    elif raw_status == "Created":
+        return "Đơn hàng đã được khởi tạo"
+    elif raw_status in ("Cancelled", "Hủy"):
+        return "Đơn hàng đã bị hủy"
+    else:
+        return msg or raw_status
+
 def format_spx_card(tracking_number: str, label: str, event: dict) -> str:
     """
     Định dạng thông báo chuẩn theo mẫu EXPRESS VN TRACK BOT:
@@ -91,29 +117,11 @@ def format_spx_card(tracking_number: str, label: str, event: dict) -> str:
         next_loc = m_next.group(1)
 
     # 3. Chuyển ngữ sang tiếng Việt chuẩn theo mẫu
+    status_vn = translate_spx_status(raw_status, msg, loc)
     if raw_status in ("FMHub_Pickup_Done", "Picked Up"):
-        status_vn = "Đơn vị vận chuyển lấy hàng thành công"
         if loc and not next_loc:
             next_loc = loc
         loc = ""  # Không in dòng Location ở mốc lấy hàng theo mẫu
-    elif "Received" in raw_status:
-        status_vn = f"Đơn hàng đã đến kho {loc}" if loc else "Đơn hàng đã đến kho"
-    elif "Sorting" in raw_status:
-        status_vn = "Đơn hàng đã được phân loại và sẵn sàng trung chuyển đến điểm kế tiếp"
-    elif "Transporting" in raw_status or "LHTransporting" in raw_status:
-        status_vn = "Đơn hàng đã lên xe trung chuyển"
-    elif "Unloading" in raw_status or "Unloaded" in raw_status:
-        status_vn = "Đơn hàng đã được phân loại và sẵn sàng trung chuyển đến điểm kế tiếp"
-    elif raw_status in ("Delivering", "Out for Delivery"):
-        status_vn = "Đơn hàng đang được giao đến bạn"
-    elif raw_status in ("Delivered", "Delivery_Done"):
-        status_vn = "Đơn hàng đã giao thành công"
-    elif raw_status == "Created":
-        status_vn = "Đơn hàng đã được khởi tạo"
-    elif raw_status in ("Cancelled", "Hủy"):
-        status_vn = "Đơn hàng đã bị hủy"
-    else:
-        status_vn = msg or raw_status
         
     # Tên đơn hàng: chỉ in kèm ngoặc đơn nếu người dùng có đặt tên riêng
     clean_label = label.strip() if label else ""
@@ -196,7 +204,8 @@ def fetch_spx_tracking(tracking_number: str) -> Optional[Dict[str, Any]]:
     
     return {
         "tracking_number": data.get("sls_tracking_number", clean_code),
-        "latest_status": status_title,
+        "latest_status": translate_spx_status(status_title, detail_msg, location),
+        "raw_status": status_title,
         "detail_message": detail_msg,
         "location": location,
         "timestamp": checkpoint_time,
