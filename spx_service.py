@@ -4,6 +4,7 @@ import hashlib
 import logging
 import sys
 import re
+import html
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
@@ -58,30 +59,74 @@ def generate_signed_tracking_number(tracking_number: str) -> str:
     return f"{code}|{ts}{sig}"
 
 def translate_spx_status(raw_status: str, msg: str = "", loc: str = "") -> str:
-    """Chuyển đổi trạng thái mã code của SPX sang tiếng Việt chuẩn và dễ hiểu."""
+    """Chuyển đổi trạng thái mã code của SPX sang tiếng Việt chuẩn, phân biệt rõ Đang giao vs Đã giao thành công."""
     if not raw_status and not msg:
         return "Đang vận chuyển"
     raw_status = str(raw_status or "")
-    if raw_status in ("FMHub_Pickup_Done", "Picked Up"):
-        return "Đơn vị vận chuyển lấy hàng thành công"
-    elif "Received" in raw_status:
-        return f"Đơn hàng đã đến kho {loc}" if loc else "Đơn hàng đã đến kho"
-    elif "Sorting" in raw_status:
-        return "Đơn hàng đã được phân loại và sẵn sàng trung chuyển đến điểm kế tiếp"
-    elif "Transporting" in raw_status or "LHTransporting" in raw_status:
-        return "Đơn hàng đã lên xe trung chuyển"
-    elif "Unloading" in raw_status or "Unloaded" in raw_status:
-        return "Đơn hàng đã được phân loại và sẵn sàng trung chuyển đến điểm kế tiếp"
-    elif raw_status in ("Delivering", "Out for Delivery"):
-        return "Đơn hàng đang được giao đến bạn"
-    elif raw_status in ("Delivered", "Delivery_Done"):
+    msg = str(msg or "")
+    status_lower = raw_status.lower()
+    msg_lower = msg.lower()
+    full_lower = f"{status_lower} {msg_lower}"
+
+    # 1. ĐÃ GIAO HÀNG THÀNH CÔNG (Chỉ khi có xác nhận giao hoàn tất rõ ràng)
+    if (
+        "delivery_done" in status_lower
+        or status_lower == "delivered"
+        or "pod_done" in status_lower
+        or "giao hàng thành công" in full_lower
+        or "giao thành công" in full_lower
+        or "đã giao hàng thành công" in full_lower
+        or "đã nhận hàng" in full_lower
+        or "ký nhận thành công" in full_lower
+    ):
         return "Đơn hàng đã giao thành công"
-    elif raw_status == "Created":
+
+    # 2. ĐANG GIAO HÀNG (Shipper đang trên đường đi giao đến người nhận)
+    if (
+        "delivering" in status_lower
+        or "out for delivery" in full_lower
+        or "out_for_delivery" in status_lower
+        or "đang được giao" in full_lower
+        or "đang giao hàng" in full_lower
+        or "đang đi giao" in full_lower
+        or "đang giao" in full_lower
+    ):
+        return "Đơn hàng đang được giao đến bạn"
+
+    # 3. ĐÃ HỦY / CHUYỂN HOÀN
+    if (
+        "cancelled" in status_lower
+        or "canceled" in status_lower
+        or "return_done" in status_lower
+        or "returned" in status_lower
+        or "hủy đơn" in full_lower
+        or "đã hủy" in full_lower
+        or "chuyển hoàn" in full_lower
+        or "trả hàng" in full_lower
+    ):
+        return "Đơn hàng đã bị hủy / chuyển hoàn"
+
+    # 4. LẤY HÀNG THÀNH CÔNG
+    if "pickup_done" in status_lower or "picked up" in status_lower or "picked_up" in status_lower:
+        return "Đơn vị vận chuyển lấy hàng thành công"
+
+    # 5. ĐẾN KHO
+    if "received" in status_lower:
+        return f"Đơn hàng đã đến kho {loc}" if loc else "Đơn hàng đã đến kho"
+
+    # 6. PHÂN LOẠI
+    if "sorting" in status_lower or "unloading" in status_lower or "unloaded" in status_lower:
+        return "Đơn hàng đã được phân loại và sẵn sàng trung chuyển đến điểm kế tiếp"
+
+    # 7. TRUNG CHUYỂN
+    if "transporting" in status_lower or "lhtransporting" in status_lower:
+        return "Đơn hàng đã lên xe trung chuyển"
+
+    # 8. KHỞI TẠO
+    if "created" in status_lower:
         return "Đơn hàng đã được khởi tạo"
-    elif raw_status in ("Cancelled", "Hủy"):
-        return "Đơn hàng đã bị hủy"
-    else:
-        return msg or raw_status
+
+    return msg or raw_status
 
 def format_spx_card(tracking_number: str, label: str, event: dict) -> str:
     """
@@ -146,6 +191,61 @@ def format_spx_card(tracking_number: str, label: str, event: dict) -> str:
         
     return "\n".join(lines)
 
+def format_full_journey(info: dict, label: str = "") -> str:
+    """Định dạng toàn bộ lịch sử hành trình chi tiết của đơn hàng (Full Timeline)."""
+    code = info.get("tracking_number", "")
+    clean_label = label.strip() if label else ""
+    if clean_label and clean_label.lower() not in ("đơn hàng spx", "đơn spx", "none", ""):
+        pkg_title = f"{code} ({clean_label})"
+    else:
+        pkg_title = code
+
+    current_status = info.get("latest_status", "Đang cập nhật")
+    current_time = format_timestamp(info.get("timestamp", 0))
+    history = info.get("history", [])
+
+    lines = [
+        "📜 <b>CHI TIẾT TOÀN BỘ HÀNH TRÌNH ĐƠN HÀNG</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"📦 <b>Mã đơn:</b> <code>{code}</code>",
+        f"📌 <b>Trạng thái:</b> <b>{html.escape(current_status)}</b>",
+        f"🕒 <b>Cập nhật:</b> {current_time}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"📋 <b>Lịch sử chi tiết ({len(history)} mốc):</b>\n"
+    ]
+
+    if not history:
+        lines.append("<i>Chưa có dữ liệu lịch sử các mốc vận chuyển.</i>")
+    else:
+        for idx, event in enumerate(history, 1):
+            ts = event.get("timestamp") or event.get("checkpoint_time", 0)
+            t_str = format_timestamp(ts)
+            raw_st = event.get("status", "")
+            raw_msg = event.get("message", "") or event.get("description", "")
+            loc = event.get("location") or event.get("hub_name", "")
+            if not loc:
+                m_at = re.search(r'at \[(.*?)\]', raw_msg)
+                if m_at:
+                    loc = m_at.group(1)
+                else:
+                    m_b = re.search(r'^\[(.*?)\]', raw_msg)
+                    if m_b and not m_b.group(1).startswith("TO"):
+                        loc = m_b.group(1)
+
+            st_vn = translate_spx_status(raw_st, raw_msg, loc)
+
+            event_text = f"<b>{idx}.</b> 🕒 <code>{t_str}</code>\n   🔹 <b>{html.escape(st_vn)}</b>"
+            if loc and loc not in st_vn:
+                event_text += f"\n   📍 Kho: {html.escape(loc)}"
+            
+            m_next = re.search(r'transporting to \[(.*?)\]', raw_msg)
+            if m_next:
+                event_text += f"\n   🚚 Đến kho: {html.escape(m_next.group(1))}"
+
+            lines.append(event_text)
+
+    return "\n".join(lines)
+
 def fetch_spx_tracking(tracking_number: str) -> Optional[Dict[str, Any]]:
     """Tra cứu hành trình kiện hàng từ SPX Express Việt Nam với chữ ký số."""
     clean_code = tracking_number.strip().upper()
@@ -200,9 +300,43 @@ def fetch_spx_tracking(tracking_number: str) -> Optional[Dict[str, Any]]:
         location = latest_event.get("location") or latest_event.get("hub_name", "")
         detail_msg = latest_event.get("message") or latest_event.get("description", "")
         
+    status_lower = (status_title or "").lower()
     full_text = f"{status_title} {detail_msg}".lower()
-    is_delivered = any(k in full_text for k in DELIVERY_COMPLETE_KEYWORDS)
-    is_cancelled = any(k in full_text for k in CANCELLED_KEYWORDS)
+
+    # Phân biệt rõ ràng ĐANG GIAO HÀNG vs ĐÃ GIAO HÀNG THÀNH CÔNG
+    is_delivering = (
+        "delivering" in status_lower
+        or "out for delivery" in full_text
+        or "out_for_delivery" in status_lower
+        or "đang được giao" in full_text
+        or "đang giao" in full_text
+        or "đang đi giao" in full_text
+    )
+
+    is_delivered = (
+        (
+            "delivery_done" in status_lower
+            or status_lower == "delivered"
+            or "pod_done" in status_lower
+            or "giao hàng thành công" in full_text
+            or "giao thành công" in full_text
+            or "đã giao hàng thành công" in full_text
+            or "đã nhận hàng" in full_text
+            or "ký nhận thành công" in full_text
+        )
+        and not is_delivering
+    )
+
+    is_cancelled = (
+        "cancelled" in status_lower
+        or "canceled" in status_lower
+        or "return_done" in status_lower
+        or "returned" in status_lower
+        or "đã hủy" in full_text
+        or "hủy đơn" in full_text
+        or "chuyển hoàn thành công" in full_text
+        or "trả hàng thành công" in full_text
+    )
     
     return {
         "tracking_number": data.get("sls_tracking_number", clean_code),

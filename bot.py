@@ -12,12 +12,19 @@ if sys.platform == "win32":
         pass
 
 from dotenv import load_dotenv
-from telegram import Update, BotCommand
+from telegram import (
+    Update, 
+    BotCommand, 
+    ForceReply, 
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -30,7 +37,13 @@ from database import (
     get_all_active_trackings,
     update_tracking_status,
 )
-from spx_service import fetch_spx_tracking, format_timestamp, format_spx_card, translate_spx_status
+from spx_service import (
+    fetch_spx_tracking, 
+    format_timestamp, 
+    format_spx_card, 
+    format_full_journey,
+    translate_spx_status
+)
 
 # Tải biến môi trường
 load_dotenv()
@@ -154,14 +167,36 @@ async def process_tracking_request(update: Update, tracking_number: str, label: 
     card += "\n\n🔔 Bot đã bật tự động theo dõi cho đơn hàng này!"
     await status_msg.edit_text(card)
 
+async def send_full_journey(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE, label: str = ""):
+    """Tra cứu và gửi toàn bộ hành trình chi tiết của đơn hàng."""
+    status_msg = await context.bot.send_message(
+        chat_id=chat_id, 
+        text=f"⏳ Đang tải toàn bộ hành trình cho mã <code>{html.escape(code)}</code>...", 
+        parse_mode=ParseMode.HTML
+    )
+    loop = asyncio.get_running_loop()
+    info = await loop.run_in_executor(None, fetch_spx_tracking, code)
+
+    if not info:
+        await status_msg.edit_text(f"❌ Không tìm thấy thông tin cho mã: <code>{html.escape(code)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    full_journey_text = format_full_journey(info, label)
+    try:
+        await status_msg.edit_text(full_journey_text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.warning(f"Lỗi gửi HTML full journey: {e}, fallback text thường")
+        clean = re.sub(r'<[^>]+>', '', full_journey_text)
+        await status_msg.edit_text(clean)
+
 async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lệnh /track <mã_vận_đơn> [tên_gợi_nhớ]."""
+    """Lệnh /track [mã] [tên_gợi_nhớ]: Đăng ký theo dõi đơn hàng tự động."""
     if not context.args:
         await update.message.reply_text(
-            "⚠️ Vui lòng nhập mã vận đơn!\n"
-            "Cú pháp: `/track <mã_vận_đơn> [tên_gợi_nhớ]`\n"
-            "Ví dụ: `/track SPXVN045388374941 Đơn Quần Áo`",
-            parse_mode=ParseMode.MARKDOWN
+            "➕ <b>THEO DÕI ĐƠN HÀNG TỰ ĐỘNG</b>\n\n"
+            "👇 <i>Dán mã SPXVN... (kèm tên gợi nhớ nếu có) vào đây:</i>",
+            reply_markup=ForceReply(selective=True, input_field_placeholder="Ví dụ: SPXVN06479385806A Áo thun"),
+            parse_mode=ParseMode.HTML
         )
         return
 
@@ -170,27 +205,21 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_tracking_request(update, tracking_number, label)
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lệnh /check <mã>: Tra cứu nhanh 1 lần không lưu vào danh sách tự động theo dõi."""
+    """Lệnh /check [mã]: Tra cứu toàn bộ hành trình chi tiết."""
     if not context.args:
-        await update.message.reply_text("⚠️ Nhập mã cần tra cứu. Ví dụ: `/check SPXVN045388374941`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            "🔍 <b>TRA CỨU TOÀN BỘ HÀNH TRÌNH</b>\n\n"
+            "👇 <i>Dán mã SPXVN... cần tra cứu vào đây:</i>",
+            reply_markup=ForceReply(selective=True, input_field_placeholder="Dán mã SPXVN... vào đây"),
+            parse_mode=ParseMode.HTML
+        )
         return
 
     code = context.args[0].strip().upper()
-    status_msg = await update.message.reply_text("⏳ Đang tra cứu nhanh...")
-
-    loop = asyncio.get_running_loop()
-    info = await loop.run_in_executor(None, fetch_spx_tracking, code)
-
-    if not info:
-        await status_msg.edit_text(f"❌ Không tìm thấy thông tin cho mã: `{code}`.", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    latest_event = info.get("latest_event") or {}
-    card = format_spx_card(info["tracking_number"], "", latest_event)
-    await status_msg.edit_text(card)
+    await send_full_journey(update.effective_chat.id, code, context)
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lệnh /list liệt kê các đơn đang chờ giao."""
+    """Lệnh /list liệt kê các đơn đang chờ giao kèm nút bấm xem hành trình."""
     try:
         chat_id = update.effective_chat.id
         rows = await get_active_trackings_by_chat(chat_id)
@@ -204,43 +233,51 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         lines = [f"📋 <b>DANH SÁCH ĐƠN ĐANG THEO DÕI ({len(rows)} đơn):</b>\n"]
+        keyboard = []
+
         for idx, r in enumerate(rows, 1):
             t_str = format_timestamp(r["last_timestamp"])
+            code = r["tracking_number"]
             lbl = (r["label"] or "").strip()
             lbl_escaped = html.escape(lbl)
             label_part = f" ({lbl_escaped})" if lbl_escaped and lbl_escaped.lower() not in ("đơn hàng spx", "đơn spx", "none", "") else ""
             status_text = html.escape(translate_spx_status(r["last_status"] or ""))
-            code_escaped = html.escape(r["tracking_number"])
+            code_escaped = html.escape(code)
+            
             lines.append(
                 f"<b>{idx}.</b> <code>{code_escaped}</code>{label_part}\n"
                 f"   📌 Trạng thái: {status_text}\n"
                 f"   🕒 Cập nhật: {t_str}\n"
+                f"   👉 Xem hành trình: /check_{code}\n"
             )
-        lines.append("👉 Dùng <code>/untrack &lt;mã&gt;</code> nếu muốn hủy theo dõi đơn nào.")
+
+            # Thêm nút bấm tương tác cho từng đơn: Bấm là ra full hành trình ngay!
+            btn_name = f"🔍 {code}" + (f" ({lbl[:8]}..)" if len(lbl) > 8 else f" ({lbl})" if lbl else "")
+            keyboard.append([
+                InlineKeyboardButton(btn_name, callback_data=f"journey:{code}"),
+                InlineKeyboardButton("🗑 Hủy", callback_data=f"untrack:{code}")
+            ])
+
+        lines.append("<i>💡 Bấm thẳng vào nút trên hoặc link lệnh /check_... để xem full hành trình!</i>")
         full_text = "\n".join(lines)
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
         try:
-            await update.message.reply_text(full_text, parse_mode=ParseMode.HTML)
+            await update.message.reply_text(full_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
         except Exception as send_err:
             logger.warning(f"Lỗi gửi HTML trong /list ({send_err}), fallback sang text thường")
             clean_text = re.sub(r'<[^>]+>', '', full_text).replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
-            await update.message.reply_text(clean_text)
+            await update.message.reply_text(clean_text, reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"Lỗi list_command: {e}", exc_info=True)
         await update.message.reply_text("⚠️ Có lỗi xảy ra khi lấy danh sách đơn. Vui lòng thử lại sau!")
 
 async def untrack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lệnh /untrack <mã>."""
-    try:
-        chat_id = update.effective_chat.id
-        if not context.args:
-            await update.message.reply_text(
-                "⚠️ Vui lòng nhập mã vận đơn muốn dừng theo dõi!\n"
-                "Ví dụ: <code>/untrack SPXVN045388374941</code>",
-                parse_mode=ParseMode.HTML
-            )
-            return
+    """Lệnh /untrack [mã]: Hiển thị danh sách các đơn đang theo dõi kèm nút Hủy trực tiếp bên cạnh."""
+    chat_id = update.effective_chat.id
 
+    # 1. Nếu người dùng nhập mã trực tiếp: /untrack SPXVN...
+    if context.args:
         code = context.args[0].strip().upper()
         success = await remove_tracking(chat_id, code)
         code_escaped = html.escape(code)
@@ -248,31 +285,184 @@ async def untrack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🗑 Đã dừng theo dõi đơn <code>{code_escaped}</code> thành công.", parse_mode=ParseMode.HTML)
         else:
             await update.message.reply_text(f"❓ Không tìm thấy mã <code>{code_escaped}</code> trong danh sách theo dõi của bạn.", parse_mode=ParseMode.HTML)
+        return
+
+    # 2. Nếu không nhập mã: Tự động liệt kê danh sách đơn kèm từng nút Remove (Hủy) bên cạnh
+    rows = await get_active_trackings_by_chat(chat_id)
+    if not rows:
+        await update.message.reply_text(
+            "📭 Hiện tại bạn không có đơn hàng nào đang theo dõi để hủy.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    lines = [
+        "🗑 <b>CHỌN ĐƠN HÀNG CẦN HỦY THEO DÕI:</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    keyboard = []
+
+    for idx, r in enumerate(rows, 1):
+        code = r["tracking_number"]
+        lbl = (r["label"] or "").strip()
+        lbl_escaped = html.escape(lbl)
+        label_part = f" ({lbl_escaped})" if lbl_escaped and lbl_escaped.lower() not in ("đơn hàng spx", "đơn spx", "none", "") else ""
+        status_text = html.escape(translate_spx_status(r["last_status"] or ""))
+        
+        lines.append(
+            f"<b>{idx}.</b> <code>{html.escape(code)}</code>{label_part}\n"
+            f"   📌 Trạng thái: {status_text}\n"
+        )
+
+        btn_label = f"{code}" + (f" ({lbl[:8]}..)" if len(lbl) > 8 else f" ({lbl})" if lbl else "")
+        keyboard.append([
+            InlineKeyboardButton(f"📦 {btn_label}", callback_data=f"journey:{code}"),
+            InlineKeyboardButton("❌ Hủy (Untrack)", callback_data=f"untrack_btn:{code}")
+        ])
+
+    lines.append("👇 <i>Bấm vào nút <b>[❌ Hủy (Untrack)]</b> tương ứng để dừng theo dõi:</i>")
+    full_text = "\n".join(lines)
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await update.message.reply_text(full_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
     except Exception as e:
-        logger.error(f"Lỗi untrack_command: {e}", exc_info=True)
-        await update.message.reply_text("⚠️ Đã xảy ra lỗi khi hủy theo dõi. Vui lòng thử lại sau.")
+        logger.warning(f"Lỗi gửi HTML trong /untrack: {e}")
+        clean_text = re.sub(r'<[^>]+>', '', full_text).replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+        await update.message.reply_text(clean_text, reply_markup=reply_markup)
+
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý sự kiện khi người dùng bấm vào các nút Inline Keyboard."""
+    query = update.callback_query
+    data = query.data or ""
+    chat_id = update.effective_chat.id
+
+    if data.startswith("journey:"):
+        code = data.split("journey:")[1].strip().upper()
+        await query.answer("⏳ Đang tải toàn bộ hành trình...")
+        await send_full_journey(chat_id, code, context)
+    elif data.startswith("untrack_btn:") or data.startswith("untrack:"):
+        code = data.replace("untrack_btn:", "").replace("untrack:", "").strip().upper()
+        success = await remove_tracking(chat_id, code)
+        if success:
+            await query.answer(f"✅ Đã hủy theo dõi {code}")
+            
+            # Tự động cập nhật lại giao diện danh sách ngay tức thì
+            remaining_rows = await get_active_trackings_by_chat(chat_id)
+            if not remaining_rows:
+                await query.edit_message_text(
+                    f"🗑 Đã hủy theo dõi đơn <code>{html.escape(code)}</code> thành công!\n\n"
+                    "📭 Danh sách theo dõi của bạn hiện đang trống.",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                lines = [
+                    f"✅ <i>Đã hủy theo dõi đơn <code>{html.escape(code)}</code> thành công!</i>\n",
+                    "🗑 <b>CÁC ĐƠN HÀNG CÒN LẠI ĐANG THEO DÕI:</b>",
+                    "━━━━━━━━━━━━━━━━━━━━━━",
+                ]
+                new_keyboard = []
+                for idx, r in enumerate(remaining_rows, 1):
+                    c = r["tracking_number"]
+                    lbl = (r["label"] or "").strip()
+                    lbl_escaped = html.escape(lbl)
+                    label_part = f" ({lbl_escaped})" if lbl_escaped and lbl_escaped.lower() not in ("đơn hàng spx", "đơn spx", "none", "") else ""
+                    status_text = html.escape(translate_spx_status(r["last_status"] or ""))
+                    lines.append(
+                        f"<b>{idx}.</b> <code>{html.escape(c)}</code>{label_part}\n"
+                        f"   📌 Trạng thái: {status_text}\n"
+                    )
+                    btn_label = f"{c}" + (f" ({lbl[:8]}..)" if len(lbl) > 8 else f" ({lbl})" if lbl else "")
+                    new_keyboard.append([
+                        InlineKeyboardButton(f"📦 {btn_label}", callback_data=f"journey:{c}"),
+                        InlineKeyboardButton("❌ Hủy (Untrack)", callback_data=f"untrack_btn:{c}")
+                    ])
+                lines.append("👇 <i>Bấm vào nút <b>[❌ Hủy (Untrack)]</b> bên cạnh đơn để tiếp tục hủy:</i>")
+                full_text = "\n".join(lines)
+                try:
+                    await query.edit_message_text(
+                        full_text, 
+                        reply_markup=InlineKeyboardMarkup(new_keyboard), 
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception as e:
+                    logger.warning(f"Lỗi cập nhật tin nhắn sau khi untrack: {e}")
+        else:
+            await query.answer("Đơn này không còn trong danh sách!")
+    else:
+        await query.answer()
+
+async def handle_quick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xử lý lệnh nhanh dạng /check_SPXVN... hoặc /untrack_SPXVN... khi người dùng bấm vào tin nhắn."""
+    text = (update.message.text or "").strip()
+    chat_id = update.effective_chat.id
+
+    if text.startswith("/check_"):
+        code = text.replace("/check_", "").strip().upper()
+        await send_full_journey(chat_id, code, context)
+    elif text.startswith("/untrack_"):
+        code = text.replace("/untrack_", "").strip().upper()
+        success = await remove_tracking(chat_id, code)
+        code_escaped = html.escape(code)
+        if success:
+            await update.message.reply_text(f"🗑 Đã dừng theo dõi đơn <code>{code_escaped}</code> thành công.", parse_mode=ParseMode.HTML)
+        else:
+            await update.message.reply_text(f"❓ Không tìm thấy mã <code>{code_escaped}</code> trong danh sách theo dõi của bạn.", parse_mode=ParseMode.HTML)
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Tự động nhận diện khi người dùng gửi tin nhắn có chứa mã SPXVN...
-    mà không cần phải gõ lệnh /track.
+    Xử lý tin nhắn văn bản:
+    1. Trả lời từ ForceReply (khi gõ /check, /track, /untrack mà không kèm mã)
+    2. Bấm vào lệnh nhanh dạng /check_SPXVN...
+    3. Gửi trực tiếp mã SPXVN... để tra cứu & theo dõi
     """
     text = update.message.text.strip()
-    match = SPX_REGEX.search(text)
+    chat_id = update.effective_chat.id
 
+    # 1. Kiểm tra nếu tin nhắn là trả lời cho một ô chờ ForceReply
+    reply = update.message.reply_to_message
+    if reply and reply.text:
+        prompt_text = reply.text.upper()
+        if "TRA CỨU TOÀN BỘ HÀNH TRÌNH" in prompt_text or "TRA CỨU" in prompt_text:
+            match = SPX_REGEX.search(text)
+            code = match.group(1).upper() if match else text.split()[0].upper()
+            await send_full_journey(chat_id, code, context)
+            return
+        elif "HỦY THEO DÕI" in prompt_text:
+            match = SPX_REGEX.search(text)
+            code = match.group(1).upper() if match else text.split()[0].upper()
+            success = await remove_tracking(chat_id, code)
+            code_escaped = html.escape(code)
+            if success:
+                await update.message.reply_text(f"🗑 Đã dừng theo dõi đơn <code>{code_escaped}</code> thành công.", parse_mode=ParseMode.HTML)
+            else:
+                await update.message.reply_text(f"❓ Không tìm thấy mã <code>{code_escaped}</code> trong danh sách theo dõi của bạn.", parse_mode=ParseMode.HTML)
+            return
+        elif "THEO DÕI ĐƠN HÀNG" in prompt_text:
+            match = SPX_REGEX.search(text)
+            if match:
+                tracking_number = match.group(1).upper()
+                remaining_text = text.replace(match.group(1), "").strip()
+                label = remaining_text if remaining_text else ""
+                await process_tracking_request(update, tracking_number, label)
+                return
+
+    # 2. Tự động nhận diện khi người dùng gửi tin nhắn chứa mã SPXVN...
+    match = SPX_REGEX.search(text)
     if match:
         tracking_number = match.group(1).upper()
-        # Trích xuất phần text còn lại làm nhãn gợi nhớ nếu có
         remaining_text = text.replace(match.group(1), "").strip()
         label = remaining_text if remaining_text else ""
         await process_tracking_request(update, tracking_number, label)
     else:
         # Nếu gửi tin nhắn thường không khớp mã SPX
         await update.message.reply_text(
-            "💡 Nếu bạn muốn tra cứu đơn hàng, hãy gửi mã vận đơn có dạng `SPXVN...`\n"
-            "Ví dụ: `SPXVN045388374941 Quần Jean`\n"
-            "Hoặc gõ lệnh `/help` để xem các tính năng.",
-            parse_mode=ParseMode.MARKDOWN
+            "💡 <b>HƯỚNG DẪN:</b>\n\n"
+            "• Gửi thẳng mã vận đơn (VD: <code>SPXVN045388374941 Quần Jean</code>) để theo dõi tự động.\n"
+            "• Gõ lệnh /check để tra cứu toàn bộ hành trình.\n"
+            "• Gõ lệnh /list để xem danh sách đơn đang theo dõi.\n"
+            "• Gõ lệnh /help để xem chi tiết cú pháp.",
+            parse_mode=ParseMode.HTML
         )
 
 # ================= BACKGROUND POLLING JOB ================= #
@@ -386,7 +576,13 @@ def main():
     app.add_handler(CommandHandler("list", list_command))
     app.add_handler(CommandHandler("untrack", untrack_command))
 
-    # Tự động bắt tin nhắn văn bản khi người dùng gõ SPXVN...
+    # Xử lý các nút bấm tương tác (Inline Buttons)
+    app.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    # Xử lý khi người dùng bấm vào lệnh nhanh /check_SPXVN... hoặc /untrack_SPXVN...
+    app.add_handler(MessageHandler(filters.Regex(r'^/(check|untrack)_'), handle_quick_command))
+
+    # Tự động bắt tin nhắn văn bản khi người dùng gõ SPXVN... hoặc phản hồi từ ForceReply
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     # Đăng ký Polling Job chạy định kỳ mỗi POLL_INTERVAL_MINUTES phút
