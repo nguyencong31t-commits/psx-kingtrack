@@ -11,7 +11,7 @@ if sys.platform == "win32":
         pass
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -300,6 +300,19 @@ async def poll_spx_updates_job(context: ContextTypes.DEFAULT_TYPE):
         # Nghỉ 2 giây giữa các request để giữ an toàn cho IP
         await asyncio.sleep(2.0)
 
+async def post_init(application: Application):
+    """Tự động đăng ký danh sách menu lệnh với Telegram."""
+    commands = [
+        BotCommand("start", "Bắt đầu & hướng dẫn sử dụng"),
+        BotCommand("list", "Xem danh sách đơn đang theo dõi"),
+        BotCommand("check", "Kiểm tra nhanh tình trạng đơn"),
+        BotCommand("track", "Theo dõi đơn: /track SPXVN..."),
+        BotCommand("untrack", "Hủy theo dõi đơn: /untrack SPXVN..."),
+        BotCommand("help", "Xem trợ giúp & cú pháp"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("Đã tự động đăng ký danh sách menu lệnh với Telegram thành công!")
+
 def main():
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
         print("\n" + "=" * 60)
@@ -311,8 +324,8 @@ def main():
     # Khởi tạo CSDL SQLite
     asyncio.run(init_db())
 
-    # Khởi tạo ứng dụng Telegram Bot kèm JobQueue
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Khởi tạo ứng dụng Telegram Bot kèm JobQueue và menu lệnh
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # Đăng ký các bộ xử lý lệnh
     app.add_handler(CommandHandler(["start", "help"], start_command))
