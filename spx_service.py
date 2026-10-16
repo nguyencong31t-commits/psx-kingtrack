@@ -35,11 +35,16 @@ CANCELLED_KEYWORDS = [
     "cancelled", "đã hủy", "hủy đơn", "trả hàng thành công", "chuyển hoàn thành công", "đã hoàn hàng"
 ]
 
+from datetime import datetime, timezone, timedelta
+
+# Múi giờ Việt Nam UTC+7
+VN_TZ = timezone(timedelta(hours=7))
+
 def format_timestamp(ts: int) -> str:
-    """Chuyển Unix timestamp (giây) sang định dạng ngày giờ Việt Nam."""
+    """Chuyển Unix timestamp (giây) sang định dạng ngày giờ Việt Nam (UTC+7)."""
     if not ts:
         return "N/A"
-    return datetime.fromtimestamp(ts).strftime("%H:%M:%S %d/%m/%Y")
+    return datetime.fromtimestamp(ts, tz=VN_TZ).strftime("%H:%M:%S %d/%m/%Y")
 
 def generate_signed_tracking_number(tracking_number: str) -> str:
     """Tạo chữ ký SHA256 cho mã vận đơn theo thuật toán của SPX."""
@@ -110,10 +115,17 @@ def format_spx_card(tracking_number: str, label: str, event: dict) -> str:
     else:
         status_vn = msg or raw_status
         
+    # Tên đơn hàng: chỉ in kèm ngoặc đơn nếu người dùng có đặt tên riêng
+    clean_label = label.strip() if label else ""
+    if clean_label and clean_label.lower() not in ("đơn hàng spx", "đơn spx", "tra cứu nhanh", "none"):
+        pkg_line = f"📦 {tracking_number} ({clean_label})"
+    else:
+        pkg_line = f"📦 {tracking_number}"
+
     lines = [
         f"🔔 SPX Update: {status_vn}",
         "━━━━━━━━━━━━━━",
-        f"📦 {tracking_number} ({label})",
+        pkg_line,
         f"📌 Status: {status_vn}",
         f"🕒 Date: {date_str}"
     ]

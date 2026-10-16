@@ -134,7 +134,7 @@ async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tracking_number = context.args[0].strip().upper()
-    label = " ".join(context.args[1:]).strip() if len(context.args) > 1 else "Đơn Shopee"
+    label = " ".join(context.args[1:]).strip() if len(context.args) > 1 else ""
     await process_tracking_request(update, tracking_number, label)
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -154,7 +154,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     latest_event = info.get("latest_event") or {}
-    card = format_spx_card(info["tracking_number"], "Tra cứu nhanh", latest_event)
+    card = format_spx_card(info["tracking_number"], "", latest_event)
     await status_msg.edit_text(card)
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -173,9 +173,10 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"📋 *DANH SÁCH ĐƠN ĐANG THEO DÕI ({len(rows)} đơn):*\n"]
     for idx, r in enumerate(rows, 1):
         t_str = format_timestamp(r["last_timestamp"])
+        lbl = r["label"]
+        label_part = f" ({lbl})" if lbl and lbl.lower() not in ("đơn hàng spx", "đơn spx", "") else ""
         lines.append(
-            f"*{idx}. {r['label']}*\n"
-            f"   🔢 Mã: `{r['tracking_number']}`\n"
+            f"*{idx}.* `{r['tracking_number']}`{label_part}\n"
             f"   📊 Trạng thái: _{r['last_status']}_\n"
             f"   🕒 Cập nhật: {t_str}\n"
         )
@@ -212,7 +213,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         tracking_number = match.group(1).upper()
         # Trích xuất phần text còn lại làm nhãn gợi nhớ nếu có
         remaining_text = text.replace(match.group(1), "").strip()
-        label = remaining_text if remaining_text else "Đơn hàng SPX"
+        label = remaining_text if remaining_text else ""
         await process_tracking_request(update, tracking_number, label)
     else:
         # Nếu gửi tin nhắn thường không khớp mã SPX
