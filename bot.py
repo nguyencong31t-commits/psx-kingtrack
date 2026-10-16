@@ -50,12 +50,36 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 SPX_REGEX = re.compile(r'(SPXVN[A-Za-z0-9]+)', re.IGNORECASE)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Máy chủ HTTP mini phục vụ Health Check cho Koyeb/Render."""
+    """Máy chủ HTTP mini trả về HTML và hỗ trợ HEAD/GET cho UptimeRobot, Render, Koyeb."""
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.end_headers()
+
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"SPX Telegram Bot is alive and healthy!")
+        html = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>SPX Bot Status</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #0f172a; color: #f8fafc; }
+        .card { text-align: center; padding: 40px; background: #1e293b; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.3); }
+        .badge { display: inline-block; padding: 6px 16px; border-radius: 20px; background: #10b981; color: #fff; font-weight: bold; margin-bottom: 16px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="badge">SYSTEM ONLINE</div>
+        <h2>SPX Telegram Tracking Bot</h2>
+        <p style="color: #94a3b8;">Bot is actively running and polling orders.</p>
+    </div>
+</body>
+</html>"""
+        self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, format, *args):
         pass
