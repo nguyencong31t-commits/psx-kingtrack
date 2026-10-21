@@ -356,9 +356,9 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lệnh /list liệt kê các đơn đang chờ giao kèm ngày dự kiến và nút bấm xem hành trình."""
+    """Lệnh /list quét live toàn bộ các đơn đang chờ giao trên máy chủ SPX để cập nhật trạng thái & ngày dự kiến mới nhất."""
+    chat_id = update.effective_chat.id
     try:
-        chat_id = update.effective_chat.id
         rows = await get_active_trackings_by_chat(chat_id)
 
         if not rows:
@@ -369,35 +369,84 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # Báo cho người dùng biết bot đang quét live thời gian thực
+        status_msg = await update.message.reply_text(
+            f"⏳ Đang kết nối máy chủ SPX quét mới {len(rows)} đơn hàng...",
+            parse_mode=ParseMode.HTML
+        )
+
+        loop = asyncio.get_running_loop()
+        sem = asyncio.Semaphore(4)
+
+        async def fetch_one(r):
+            c = r["tracking_number"]
+            l = r["label"] or ""
+            async with sem:
+                try:
+                    info = await loop.run_in_executor(None, fetch_spx_tracking, c, l)
+                    return (r, info)
+                except Exception as err:
+                    logger.warning(f"Lỗi scan SPX cho {c}: {err}")
+                    return (r, None)
+
+        # Quét song song tất cả các đơn để đạt tốc độ nhanh nhất (< 1 giây)
+        results = await asyncio.gather(*[fetch_one(r) for r in rows])
+
         lines = [f"📋 <b>DANH SÁCH ĐƠN ĐANG THEO DÕI ({len(rows)} đơn):</b>\n"]
         keyboard = []
 
-        for idx, r in enumerate(rows, 1):
-            t_str = format_timestamp(r["last_timestamp"])
+        for idx, (r, info) in enumerate(results, 1):
             code = r["tracking_number"]
+            code_escaped = html.escape(code)
             lbl = (r["label"] or "").strip()
             lbl_escaped = html.escape(lbl)
             label_part = f" ({lbl_escaped})" if lbl_escaped and lbl_escaped.lower() not in ("đơn hàng spx", "đơn spx", "none", "") else ""
-            status_text = html.escape(translate_spx_status(r["last_status"] or ""))
-            code_escaped = html.escape(code)
-            
-            # Ngày dự kiến giao ngay cạnh mã vận đơn
-            edd = ""
-            try:
+
+            if info:
+                st_raw = info.get("latest_status") or ""
+                ts = info.get("timestamp") or 0
+                edd = info.get("estimated_delivery") or ""
+                is_completed = bool(info.get("is_completed"))
+                is_delivered = bool(info.get("is_delivered"))
+
+                # Tự động cập nhật dữ liệu mới nhất vào database
+                if is_completed:
+                    await remove_tracking(chat_id, code)
+                else:
+                    await add_or_update_tracking(
+                        chat_id=chat_id,
+                        tracking_number=code,
+                        label=lbl,
+                        status=st_raw,
+                        timestamp=ts,
+                        estimated_delivery=edd
+                    )
+            else:
+                # Nếu mạng chập chờn không gọi được SPX thì dùng dữ liệu cache cũ trong DB
+                st_raw = r["last_status"] or ""
+                ts = r["last_timestamp"] or 0
                 edd = r["estimated_delivery"] or ""
-            except Exception:
-                pass
-            if not edd:
-                edd = estimate_delivery_date([], r["last_status"], lbl)
-            
+                is_completed = False
+                is_delivered = False
+
+            status_text = html.escape(translate_spx_status(st_raw))
+            t_str = format_timestamp(ts)
             edd_badge = f" <b>[Dự kiến: {html.escape(edd)}]</b>" if edd else ""
-            
-            lines.append(
-                f"<b>{idx}.</b> <code>{code_escaped}</code>{edd_badge}{label_part}\n"
-                f"   📌 Trạng thái: {status_text}\n"
-                f"   🕒 Cập nhật: {t_str}\n"
-                f"   👉 Xem hành trình: /check_{code}\n"
-            )
+
+            if is_completed:
+                done_desc = "🎉 Đơn đã giao thành công (tự động hoàn tất & untrack)" if is_delivered else "⚠️ Đơn đã hủy / hoàn hàng (tự động untrack)"
+                lines.append(
+                    f"<b>{idx}.</b> <code>{code_escaped}</code>{label_part}\n"
+                    f"   📌 Trạng thái: {status_text}\n"
+                    f"   {done_desc}\n"
+                )
+            else:
+                lines.append(
+                    f"<b>{idx}.</b> <code>{code_escaped}</code>{edd_badge}{label_part}\n"
+                    f"   📌 Trạng thái: {status_text}\n"
+                    f"   🕒 Cập nhật: {t_str}\n"
+                    f"   👉 Xem hành trình: /check_{code}\n"
+                )
 
             # Thêm nút bấm tương tác cho từng đơn: Bấm là ra full hành trình ngay!
             btn_name = f"🔍 {code}" + (f" ({lbl[:8]}..)" if len(lbl) > 8 else f" ({lbl})" if lbl else "")
@@ -410,11 +459,11 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         try:
-            await update.message.reply_text(full_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+            await status_msg.edit_text(full_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
         except Exception as send_err:
             logger.warning(f"Lỗi gửi HTML trong /list ({send_err}), fallback sang text thường")
             clean_text = re.sub(r'<[^>]+>', '', full_text).replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
-            await update.message.reply_text(clean_text, reply_markup=reply_markup)
+            await status_msg.edit_text(clean_text, reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"Lỗi list_command: {e}", exc_info=True)
         await update.message.reply_text("⚠️ Có lỗi xảy ra khi lấy danh sách đơn. Vui lòng thử lại sau!")
