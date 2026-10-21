@@ -84,12 +84,34 @@ def _solve_captcha_image(img_bytes: bytes, carrier: str = "GENERIC") -> str:
                         import easyocr
                         _OCR_READER = easyocr.Reader(['en'], gpu=False, verbose=False)
             if _OCR_READER:
+                # 1. Thử nhận diện sau khi crop bỏ đường gạch nhiễu bên trái (x: 35 đến 180)
+                try:
+                    if HAS_PIL:
+                        img = Image.open(io.BytesIO(img_bytes))
+                        w, h = img.size
+                        cropped = img.crop((35, 0, min(180, w), h))
+                        buf = io.BytesIO()
+                        cropped.save(buf, format='PNG')
+                        with _OCR_LOCK:
+                            c_res = _OCR_READER.readtext(buf.getvalue())
+                        raw_c = "".join([r[1] for r in c_res]).strip()
+                        clean_c = re.sub(r'[^a-zA-Z0-9]', '', raw_c).lower()
+                        if len(clean_c) == 4:
+                            return clean_c
+                        if len(clean_c) >= 5:
+                            return clean_c[-4:]
+                except Exception:
+                    pass
+
+                # 2. Thử ảnh gốc
                 with _OCR_LOCK:
                     ocr_res = _OCR_READER.readtext(img_bytes)
                 raw = "".join([r[1] for r in ocr_res]).strip()
-                clean = re.sub(r'[^a-zA-Z0-9]', '', raw)
+                clean = re.sub(r'[^a-zA-Z0-9]', '', raw).lower()
                 if len(clean) == 4:
                     return clean
+                if len(clean) >= 5:
+                    return clean[-4:]
         except Exception as e:
             logger.debug(f"EasyOCR VTP error: {e}")
 
@@ -253,7 +275,7 @@ def _http_get(url: str, headers: dict = None, timeout: int = 12) -> Optional[str
             resp = session.get(url, headers=req_headers, timeout=timeout)
             if resp.status_code == 200:
                 return resp.text
-            logger.warning(f"HTTP GET {url} returned {resp.status_code}")
+            logger.debug(f"HTTP GET {url} returned {resp.status_code}")
             return None
         except Exception as e:
             logger.debug(f"curl_cffi error on {url}: {e}, trying urllib")
@@ -498,37 +520,47 @@ def _parse_vnpost_portal_data(clean_code: str, data: dict, label: str = "") -> O
 def fetch_vnpost_tracking(code: str, label: str = "") -> Optional[Dict[str, Any]]:
     """
     Tra cứu vận đơn VNPost / EMS:
-    1. Thử qua API public EMS (https://api.myems.vn/TrackAndTraceItemCode) - nhanh, không cần captcha (mã E...VN)
-    2. Fallback qua cổng thông tin chính thức VNPost (https://vnpost.vn) giải captcha bằng EasyOCR (mã CQ..., CC..., RN...)
+    1. Nếu là mã chuyển phát nhanh EMS (mã bắt đầu bằng E như EB..., EM... hoặc EMS): ưu tiên cổng API MyEMS (siêu tốc, không cần captcha)
+    2. Nếu là mã bưu phẩm/bưu kiện thông thường (CQ..., CC..., CP..., RN...): tra cứu trực tiếp qua cổng vnpost.vn (giải captcha siêu nhẹ 0.04s)
+    3. Tự động chuyển đổi qua lại giữa 2 cổng nếu một bên không có dữ liệu.
     """
     clean_code = code.strip().upper()
-    
-    # 1. Thử qua API public EMS (https://api.myems.vn/TrackAndTraceItemCode)
-    # Lưu ý: Cổng EMS yêu cầu hậu tố 'EMS' (ví dụ: EB125966888VNEMS) để truy xuất dữ liệu
-    itemcode_param = clean_code if clean_code.endswith("EMS") else f"{clean_code}EMS"
-    api_url = f"https://api.myems.vn/TrackAndTraceItemCode?itemcode={itemcode_param}&language=0"
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://ems.com.vn/",
-        "Origin": "https://ems.com.vn"
-    }
-    raw_text = _http_get(api_url, headers=headers, timeout=10)
-    if raw_text:
-        try:
-            data = json.loads(raw_text)
-            if isinstance(data, dict) and data.get("Code") == "00":
-                res = _parse_myems_data(clean_code, data, label)
-                if res:
-                    return res
-        except Exception:
-            pass
+    is_ems_prefix = clean_code.startswith("E") or clean_code.startswith("EMS")
 
-    # 2. Nếu myems.vn không có dữ liệu (như mã bưu kiện CQ...VN), thử cổng portal vnpost.vn
-    portal_data = _fetch_vnpost_portal_live(clean_code)
-    if portal_data:
-        res = _parse_vnpost_portal_data(clean_code, portal_data, label)
+    def _try_ems() -> Optional[Dict[str, Any]]:
+        itemcode_param = clean_code if clean_code.endswith("EMS") else f"{clean_code}EMS"
+        api_url = f"https://api.myems.vn/TrackAndTraceItemCode?itemcode={itemcode_param}&language=0"
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://ems.com.vn/",
+            "Origin": "https://ems.com.vn"
+        }
+        raw_text = _http_get(api_url, headers=headers, timeout=10)
+        if raw_text:
+            try:
+                data = json.loads(raw_text)
+                if isinstance(data, dict) and data.get("Code") == "00":
+                    return _parse_myems_data(clean_code, data, label)
+            except Exception:
+                pass
+        return None
+
+    def _try_vnpost_portal() -> Optional[Dict[str, Any]]:
+        portal_data = _fetch_vnpost_portal_live(clean_code)
+        if portal_data:
+            return _parse_vnpost_portal_data(clean_code, portal_data, label)
+        return None
+
+    if is_ems_prefix:
+        res = _try_ems()
         if res:
             return res
+        return _try_vnpost_portal()
+    else:
+        res = _try_vnpost_portal()
+        if res:
+            return res
+        return _try_ems()
 
     return None
 
@@ -683,6 +715,7 @@ def _fetch_viettelpost_live(clean_code: str) -> Optional[Dict[str, Any]]:
         try:
             r1 = session.get("https://api.viettelpost.vn/api/orders/getCaptcha", headers=headers, timeout=8)
             if r1.status_code != 200:
+                logger.warning(f"VTP getCaptcha HTTP {r1.status_code}")
                 continue
             res_cap = r1.json()
             cap_data = res_cap.get("data") or {}
@@ -709,79 +742,64 @@ def _fetch_viettelpost_live(clean_code: str) -> Optional[Dict[str, Any]]:
                     items = res_json["data"]
                     if items and isinstance(items, list):
                         return items[0]
+                else:
+                    logger.debug(f"VTP attempt {attempt+1} verify failed: {res_json.get('message')}")
+            else:
+                logger.warning(f"VTP viewTrackingOrders HTTP {r2.status_code}")
         except Exception as e:
             logger.debug(f"VTP live attempt {attempt+1} error: {e}")
             continue
 
     return None
 
+_VTP_AUTO_TOKEN = None
+_VTP_TOKEN_LOCK = threading.Lock()
+
+def _get_vtp_token() -> str:
+    """Lấy token xác thực ViettelPost từ VTP_TOKEN hoặc tự động đăng nhập qua VTP_USERNAME / VTP_PASSWORD."""
+    global _VTP_AUTO_TOKEN
+    direct_token = os.getenv("VTP_TOKEN", "").strip()
+    if direct_token:
+        return direct_token
+
+    username = os.getenv("VTP_USERNAME", "").strip()
+    password = os.getenv("VTP_PASSWORD", "").strip()
+    if not username or not password:
+        return ""
+
+    with _VTP_TOKEN_LOCK:
+        if _VTP_AUTO_TOKEN:
+            return _VTP_AUTO_TOKEN
+        try:
+            login_url = "https://partner.viettelpost.vn/v2/user/Login"
+            headers = {"Content-Type": "application/json", "Accept": "application/json"}
+            payload = json.dumps({"USERNAME": username, "PASSWORD": password}).encode("utf-8")
+            import urllib.request
+            req = urllib.request.Request(login_url, data=payload, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    token = data.get("data", {}).get("token") or data.get("token") or ""
+                    if token:
+                        _VTP_AUTO_TOKEN = token
+                        logger.info("✅ Đã tự động đăng nhập và lấy Token ViettelPost Partner API thành công!")
+                        return token
+        except Exception as e:
+            logger.warning(f"Không thể tự động đăng nhập ViettelPost: {e}")
+
+    return ""
+
 def fetch_viettelpost_tracking(code: str, label: str = "") -> Dict[str, Any]:
     """
     Tra cứu vận đơn ViettelPost:
-    1. Tra cứu trực tiếp live qua api.viettelpost.vn giải captcha EasyOCR nội bộ (không cần token).
-    2. Nếu có VTP_TOKEN trong môi trường -> Gọi Partner API:
-       https://partner.viettelpost.vn/v2/order/getOrderByBill?billCode={code}
-    3. Nếu không có hoặc API lỗi -> Fallback hiển thị link tra cứu chính hãng 1-chạm.
+    1. Ưu tiên Partner API nếu có VTP_TOKEN hoặc VTP_USERNAME/VTP_PASSWORD (0% CPU, siêu tốc, không bị WAF/Cloudflare).
+    2. Nếu không có token -> Tra cứu trực tiếp live qua api.viettelpost.vn giải captcha EasyOCR cắt viền nhiễu tự động.
+    3. Fallback nếu cả 2 phương thức đều không lấy được dữ liệu.
     """
     clean_code = code.strip().upper()
 
-    # 1. Thử tra cứu live captcha giải tự động
-    live_data = _fetch_viettelpost_live(clean_code)
-    if live_data:
-        trackings = live_data.get("TRACKINGS") or []
-        history = []
-        for item in trackings:
-            if not isinstance(item, dict):
-                continue
-            h_st = item.get("ORDER_NOTE") or "Đang vận chuyển"
-            h_time = item.get("ORDER_STATUSDATE") or ""
-            h_loc = item.get("BUU_CUC") or ""
-            h_ts = parse_datetime_to_timestamp(h_time)
-            history.append({
-                "status": h_st,
-                "time": format_timestamp(h_ts) if h_ts else h_time,
-                "timestamp": h_ts,
-                "location": h_loc,
-                "message": h_st
-            })
-
-        history.sort(key=lambda x: x.get("timestamp") or 0)
-        latest_event = history[-1] if history else {}
-        latest_status = latest_event.get("status") or "Đang vận chuyển"
-        latest_time = latest_event.get("timestamp") or int(time.time())
-        latest_loc = latest_event.get("location") or live_data.get("BUUCUC_NHAN") or ""
-
-        st_lower = latest_status.lower()
-        is_delivered = any(w in st_lower for w in ["giao thành công", "đã giao", "ký nhận", "phát thành công", "đã phát"])
-        is_cancelled = any(w in st_lower for w in ["hủy", "chuyển hoàn", "trả hàng"])
-        is_completed = is_delivered or is_cancelled
-
-        edd = ""
-        if not is_completed and history:
-            first_ts = history[0].get("timestamp") or 0
-            if first_ts:
-                edd_dt = datetime.fromtimestamp(first_ts + 3 * 86400, tz=VN_TZ)
-                edd = f"~{edd_dt.strftime('%d/%m')}"
-
-        return {
-            "carrier": "VTP",
-            "carrier_name": CARRIER_NAMES["VTP"],
-            "tracking_number": clean_code,
-            "label": label or "",
-            "latest_status": latest_status,
-            "timestamp": latest_time,
-            "location": latest_loc,
-            "estimated_delivery": edd or None,
-            "is_delivered": is_delivered,
-            "is_completed": is_completed,
-            "is_cancelled": is_cancelled,
-            "history": history,
-            "tracking_url": get_tracking_url(clean_code, "VTP"),
-            "is_fallback": False
-        }
-
-    # 2. Thử gọi Partner API nếu có Token
-    vtp_token = os.getenv("VTP_TOKEN", "").strip()
+    # 1. Thử gọi Partner API nếu có Token hoặc tài khoản đối tác
+    vtp_token = _get_vtp_token()
     if vtp_token:
         try:
             api_url = f"https://partner.viettelpost.vn/v2/order/getOrderByBill?billCode={clean_code}"
@@ -837,6 +855,61 @@ def fetch_viettelpost_tracking(code: str, label: str = "") -> Dict[str, Any]:
                     }
         except Exception as e:
             logger.warning(f"Lỗi gọi ViettelPost Partner API: {e}")
+
+    # 2. Thử tra cứu live captcha giải tự động qua EasyOCR
+    live_data = _fetch_viettelpost_live(clean_code)
+    if live_data:
+        trackings = live_data.get("TRACKINGS") or []
+        history = []
+        for item in trackings:
+            if not isinstance(item, dict):
+                continue
+            h_st = item.get("ORDER_NOTE") or "Đang vận chuyển"
+            h_time = item.get("ORDER_STATUSDATE") or ""
+            h_loc = item.get("BUU_CUC") or ""
+            h_ts = parse_datetime_to_timestamp(h_time)
+            history.append({
+                "status": h_st,
+                "time": format_timestamp(h_ts) if h_ts else h_time,
+                "timestamp": h_ts,
+                "location": h_loc,
+                "message": h_st
+            })
+
+        history.sort(key=lambda x: x.get("timestamp") or 0)
+        latest_event = history[-1] if history else {}
+        latest_status = latest_event.get("status") or "Đang vận chuyển"
+        latest_time = latest_event.get("timestamp") or int(time.time())
+        latest_loc = latest_event.get("location") or live_data.get("BUUCUC_NHAN") or ""
+
+        st_lower = latest_status.lower()
+        is_delivered = any(w in st_lower for w in ["giao thành công", "đã giao", "ký nhận", "phát thành công", "đã phát"])
+        is_cancelled = any(w in st_lower for w in ["hủy", "chuyển hoàn", "trả hàng"])
+        is_completed = is_delivered or is_cancelled
+
+        edd = ""
+        if not is_completed and history:
+            first_ts = history[0].get("timestamp") or 0
+            if first_ts:
+                edd_dt = datetime.fromtimestamp(first_ts + 3 * 86400, tz=VN_TZ)
+                edd = f"~{edd_dt.strftime('%d/%m')}"
+
+        return {
+            "carrier": "VTP",
+            "carrier_name": CARRIER_NAMES["VTP"],
+            "tracking_number": clean_code,
+            "label": label or "",
+            "latest_status": latest_status,
+            "timestamp": latest_time,
+            "location": latest_loc,
+            "estimated_delivery": edd or None,
+            "is_delivered": is_delivered,
+            "is_completed": is_completed,
+            "is_cancelled": is_cancelled,
+            "history": history,
+            "tracking_url": get_tracking_url(clean_code, "VTP"),
+            "is_fallback": False
+        }
 
     # 3. Fallback nếu không tra cứu được qua API
     return {
@@ -1046,8 +1119,6 @@ def format_carrier_journey(data: dict) -> str:
             ev_text = f"<b>{idx}.</b> 🕒 <code>{t_str}</code>\n   🔹 <b>{html.escape(st)}</b>"
             if loc and loc.lower() not in st.lower():
                 ev_text += f"\n   📍 Địa điểm: {html.escape(loc)}"
-            if msg and msg.lower() != st.lower() and loc.lower() not in msg.lower():
-                ev_text += f"\n   💬 {html.escape(msg)}"
             lines.append(ev_text)
             
     return "\n".join(lines)
