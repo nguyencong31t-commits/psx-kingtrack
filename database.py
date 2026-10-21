@@ -3,12 +3,16 @@ database.py - Quản lý cơ sở dữ liệu tracking hàng hóa.
 Hỗ trợ kiến trúc Hybrid:
   - Nếu có biến môi trường TURSO_DATABASE_URL & TURSO_AUTH_TOKEN: Kết nối Turso Cloud (libSQL).
     Dữ liệu được lưu trữ vĩnh viễn trên Cloud, không bao giờ mất dù Render có khởi động lại bao nhiêu lần.
-  - Nếu không cấu hình Turso: Tự động fallback về file SQLite cục bộ (aiosqlite).
+  - Nếu không cấu hình Turso hoặc kết nối lỗi: Tự động fallback về file SQLite cục bộ (aiosqlite)
+    để đảm bảo bot hoạt động liên tục 100% không bị crash.
 """
 
 import os
+import logging
 import aiosqlite
 from typing import List, Dict, Optional, Any
+
+logger = logging.getLogger(__name__)
 
 # Hỗ trợ Turso Cloud qua libsql-client
 try:
@@ -22,65 +26,95 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _env_db = os.getenv("DATABASE_PATH", "trackings.db")
 DB_PATH = _env_db if os.path.isabs(_env_db) else os.path.join(BASE_DIR, _env_db)
 
-# Cấu hình Turso Cloud
-TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
-TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+# Biến cờ đánh dấu lỗi Turso để fallback an toàn
+_TURSO_DISABLED = False
 
 
 def is_turso_enabled() -> bool:
     """Kiểm tra hệ thống có đang sử dụng Turso Cloud hay không."""
-    return bool(HAS_LIBSQL and TURSO_DATABASE_URL)
+    global _TURSO_DISABLED
+    if _TURSO_DISABLED or not HAS_LIBSQL:
+        return False
+    url = os.getenv("TURSO_DATABASE_URL", "").strip()
+    token = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+    # Bắt buộc phải có cả URL và Auth Token
+    return bool(url and token)
 
 
 def get_turso_client():
-    """Khởi tạo Turso libSQL Client."""
+    """Khởi tạo Turso libSQL Client (Sử dụng https:// để vượt qua firewall/proxy trên Cloud)."""
+    url = os.getenv("TURSO_DATABASE_URL", "").strip()
+    token = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+    # Chuyển đổi giao thức libsql:// sang https:// giúp tương thích 100% với môi trường container Cloud (tránh lỗi WebSocket 400)
+    if url.startswith("libsql://"):
+        url = "https://" + url[len("libsql://"):]
     return libsql_client.create_client(
-        url=TURSO_DATABASE_URL,
-        auth_token=TURSO_AUTH_TOKEN if TURSO_AUTH_TOKEN else None
+        url=url,
+        auth_token=token if token else None
     )
+
+
+def _disable_turso(reason: str = ""):
+    """Vô hiệu hóa Turso và chuyển sang SQLite cục bộ khi gặp sự cố mạng/token."""
+    global _TURSO_DISABLED
+    if not _TURSO_DISABLED:
+        _TURSO_DISABLED = True
+        logger.warning(
+            f"⚠️ Kết nối Turso Cloud gặp sự cố: {reason}. "
+            f"Bot tự động chuyển sang CSDL SQLite cục bộ ({DB_PATH}) để đảm bảo hoạt động không bị gián đoạn."
+        )
 
 
 async def _execute_sql(sql: str, params: tuple = ()) -> int:
     """Thực thi lệnh INSERT/UPDATE/DELETE và trả về số dòng bị ảnh hưởng."""
     if is_turso_enabled():
-        async with get_turso_client() as client:
-            rs = await client.execute(sql, list(params))
-            return rs.rows_affected
-    else:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(sql, params)
-            await db.commit()
-            return cursor.rowcount
+        try:
+            async with get_turso_client() as client:
+                rs = await client.execute(sql, list(params))
+                return rs.rows_affected
+        except Exception as e:
+            _disable_turso(str(e))
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(sql, params)
+        await db.commit()
+        return cursor.rowcount
 
 
 async def _fetch_all(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
     """Thực thi lệnh SELECT và trả về danh sách các bản ghi dạng Dict."""
     if is_turso_enabled():
-        async with get_turso_client() as client:
-            rs = await client.execute(sql, list(params))
-            return [dict(zip(rs.columns, tuple(row))) for row in rs.rows]
-    else:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(sql, params) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        try:
+            async with get_turso_client() as client:
+                rs = await client.execute(sql, list(params))
+                return [dict(zip(rs.columns, tuple(row))) for row in rs.rows]
+        except Exception as e:
+            _disable_turso(str(e))
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
 
 
 async def _fetch_one(sql: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
     """Thực thi lệnh SELECT và trả về 1 bản ghi dạng Dict hoặc None."""
     if is_turso_enabled():
-        async with get_turso_client() as client:
-            rs = await client.execute(sql, list(params))
-            if rs.rows:
-                return dict(zip(rs.columns, tuple(rs.rows[0])))
-            return None
-    else:
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(sql, params) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
+        try:
+            async with get_turso_client() as client:
+                rs = await client.execute(sql, list(params))
+                if rs.rows:
+                    return dict(zip(rs.columns, tuple(rs.rows[0])))
+                return None
+        except Exception as e:
+            _disable_turso(str(e))
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(sql, params) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
 
 
 async def init_db():
@@ -103,47 +137,53 @@ async def init_db():
     """
 
     if is_turso_enabled():
-        async with get_turso_client() as client:
-            await client.execute(create_table_sql)
+        try:
+            async with get_turso_client() as client:
+                await client.execute(create_table_sql)
 
-            # Migration: Kiểm tra và thêm cột nếu schema cũ chưa có
-            try:
-                rs = await client.execute("PRAGMA table_info(trackings)")
-                columns = [r[1] for r in rs.rows]
+                # Migration: Kiểm tra và thêm cột nếu schema cũ chưa có
+                try:
+                    rs = await client.execute("PRAGMA table_info(trackings)")
+                    columns = [r[1] for r in rs.rows]
 
-                if "carrier" not in columns:
-                    await client.execute("ALTER TABLE trackings ADD COLUMN carrier TEXT DEFAULT 'SPX'")
-                if "estimated_delivery" not in columns:
-                    await client.execute("ALTER TABLE trackings ADD COLUMN estimated_delivery TEXT DEFAULT ''")
-            except Exception:
-                pass
+                    if "carrier" not in columns:
+                        await client.execute("ALTER TABLE trackings ADD COLUMN carrier TEXT DEFAULT 'SPX'")
+                    if "estimated_delivery" not in columns:
+                        await client.execute("ALTER TABLE trackings ADD COLUMN estimated_delivery TEXT DEFAULT ''")
+                except Exception:
+                    pass
 
-            try:
-                await client.execute("UPDATE trackings SET carrier = 'SPX' WHERE carrier IS NULL OR carrier = ''")
-            except Exception:
-                pass
-    else:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(create_table_sql)
+                try:
+                    await client.execute("UPDATE trackings SET carrier = 'SPX' WHERE carrier IS NULL OR carrier = ''")
+                except Exception:
+                    pass
+                logger.info("✅ Đã kết nối và khởi tạo thành công CSDL Turso Cloud (Always-On).")
+                return
+        except Exception as e:
+            _disable_turso(str(e))
 
-            # Migration cục bộ
-            try:
-                async with db.execute("PRAGMA table_info(trackings)") as cursor:
-                    columns = [row[1] for row in await cursor.fetchall()]
+    # Khởi tạo SQLite cục bộ (fallback)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(create_table_sql)
 
-                if "carrier" not in columns:
-                    await db.execute("ALTER TABLE trackings ADD COLUMN carrier TEXT DEFAULT 'SPX'")
-                if "estimated_delivery" not in columns:
-                    await db.execute("ALTER TABLE trackings ADD COLUMN estimated_delivery TEXT DEFAULT ''")
-            except Exception:
-                pass
+        try:
+            async with db.execute("PRAGMA table_info(trackings)") as cursor:
+                columns = [row[1] for row in await cursor.fetchall()]
 
-            try:
-                await db.execute("UPDATE trackings SET carrier = 'SPX' WHERE carrier IS NULL OR carrier = ''")
-            except Exception:
-                pass
+            if "carrier" not in columns:
+                await db.execute("ALTER TABLE trackings ADD COLUMN carrier TEXT DEFAULT 'SPX'")
+            if "estimated_delivery" not in columns:
+                await db.execute("ALTER TABLE trackings ADD COLUMN estimated_delivery TEXT DEFAULT ''")
+        except Exception:
+            pass
 
-            await db.commit()
+        try:
+            await db.execute("UPDATE trackings SET carrier = 'SPX' WHERE carrier IS NULL OR carrier = ''")
+        except Exception:
+            pass
+
+        await db.commit()
+    logger.info(f"✅ Đã khởi tạo thành công CSDL SQLite cục bộ ({DB_PATH}).")
 
 
 async def add_or_update_tracking(
