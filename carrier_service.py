@@ -838,22 +838,21 @@ def fetch_viettelpost_tracking(code: str, label: str = "") -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"Lỗi gọi ViettelPost Partner API: {e}")
 
-    # 3. Fallback 1-chạm nếu không tra cứu được qua API
-    tracking_url = get_tracking_url(clean_code, "VTP")
+    # 3. Fallback nếu không tra cứu được qua API
     return {
         "carrier": "VTP",
         "carrier_name": CARRIER_NAMES["VTP"],
         "tracking_number": clean_code,
         "label": label or "",
-        "latest_status": "Tra cứu nhanh 1-chạm qua web ViettelPost",
+        "latest_status": "Đang cập nhật từ hệ thống ViettelPost",
         "timestamp": int(time.time()),
-        "location": "ViettelPost Official",
+        "location": "",
         "estimated_delivery": None,
         "is_delivered": False,
         "is_completed": False,
         "is_cancelled": False,
         "history": [],
-        "tracking_url": tracking_url,
+        "tracking_url": "",
         "is_fallback": True
     }
 
@@ -1004,13 +1003,6 @@ def format_carrier_card(data: dict) -> str:
     if loc and not is_fallback:
         lines.append(f"📍 <b>Vị trí:</b> {html.escape(loc)}")
         
-    if is_fallback:
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"🌐 <b>Tra cứu trực tiếp:</b> <a href=\"{url}\">Mở trang web chính hãng</a>")
-        lines.append("💡 <i>Nhấn nút hoặc mở link bên trên để tra cứu chi tiết hành trình tức thì.</i>")
-    elif url:
-        lines.append(f"🌐 <b>Tra cứu online:</b> <a href=\"{url}\">Xem trên web chính hãng</a>")
-        
     return "\n".join(lines)
 
 def format_carrier_journey(data: dict) -> str:
@@ -1024,7 +1016,6 @@ def format_carrier_journey(data: dict) -> str:
     ts = data.get("timestamp", 0)
     time_str = format_timestamp(ts) if ts else "Đang cập nhật"
     history = data.get("history", [])
-    url = data.get("tracking_url") or get_tracking_url(code, carrier)
     is_fallback = data.get("is_fallback", False)
     
     if label and label.lower() not in ("đơn hàng spx", "đơn spx", "tra cứu nhanh", "none", ""):
@@ -1042,16 +1033,8 @@ def format_carrier_journey(data: dict) -> str:
         "━━━━━━━━━━━━━━━━━━━━━━"
     ]
     
-    if is_fallback:
-        lines.append(
-            f"ℹ️ <i>Đơn vị {carrier_name} hỗ trợ tra cứu hành trình trực tiếp qua cổng thông tin chính hãng.</i>\n\n"
-            f"👉 <b>Bấm vào đây để xem toàn bộ hành trình:</b>\n"
-            f"<a href=\"{url}\">{url}</a>"
-        )
-    elif not history:
-        lines.append("<i>Chưa có dữ liệu lịch sử các mốc vận chuyển chi tiết.</i>\n")
-        if url:
-            lines.append(f"👉 <a href=\"{url}\">Tra cứu trực tiếp trên trang chủ {carrier_name}</a>")
+    if is_fallback or not history:
+        lines.append("<i>Chưa có dữ liệu lịch sử các mốc vận chuyển chi tiết từ hãng.</i>")
     else:
         lines.append(f"📋 <b>Lịch sử chi tiết ({len(history)} mốc):</b>\n")
         for idx, ev in enumerate(history, 1):
@@ -1066,9 +1049,6 @@ def format_carrier_journey(data: dict) -> str:
             if msg and msg.lower() != st.lower() and loc.lower() not in msg.lower():
                 ev_text += f"\n   💬 {html.escape(msg)}"
             lines.append(ev_text)
-            
-        if url:
-            lines.append(f"\n🌐 <a href=\"{url}\">Xem trên website chính hãng {carrier_name}</a>")
             
     return "\n".join(lines)
 

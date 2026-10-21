@@ -22,6 +22,9 @@ RUN pip install --no-cache-dir torch torchvision --index-url https://download.py
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Tải sẵn model EasyOCR ngay khi build image để lúc chạy không phải tải từ mạng (tránh lag/timeout)
+RUN python -c "import easyocr; easyocr.Reader(['en'], gpu=False)"
+
 # Copy toàn bộ mã nguồn
 COPY . .
 
