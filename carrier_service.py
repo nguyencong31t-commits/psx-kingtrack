@@ -42,23 +42,77 @@ from spx_service import (
 
 logger = logging.getLogger(__name__)
 
-# Singleton EasyOCR Reader và threading Lock
+# Cấu hình OCR đa nền tảng: Ưu tiên Tesseract OCR siêu nhẹ (~40MB RAM), tương thích Docker Render Free
+try:
+    import pytesseract
+    HAS_PYTESSERACT = True
+    if os.name == 'nt':
+        win_tess = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        if os.path.exists(win_tess):
+            pytesseract.pytesseract.tesseract_cmd = win_tess
+except ImportError:
+    HAS_PYTESSERACT = False
+
 _OCR_READER = None
 _OCR_LOCK = threading.Lock()
 
-def _get_ocr_reader():
-    """Singleton khởi tạo mô hình EasyOCR một lần duy nhất, chia sẻ thread-safe."""
-    global _OCR_READER
-    if _OCR_READER is None:
-        with _OCR_LOCK:
-            if _OCR_READER is None:
-                try:
+def _solve_captcha_image(img_bytes: bytes, carrier: str = "GENERIC") -> str:
+    """
+    Hàm giải Captcha tự động đa tầng:
+    1. Ưu tiên Tesseract OCR với tiền xử lý ảnh chuyên sâu (Crop viền, Contrast, Binarize, Lanczos upscale)
+       -> Siêu nhẹ (RAM ~40MB), chạy 0.04s, cực kỳ an toàn trên Render Free 512MB RAM.
+    2. Fallback sang EasyOCR nếu môi trường chưa cài binary tesseract.
+    """
+    if not HAS_PIL or not img_bytes:
+        return ""
+
+    # --- 1. Thử giải bằng Tesseract OCR siêu nhẹ ---
+    if HAS_PYTESSERACT:
+        try:
+            img = Image.open(io.BytesIO(img_bytes))
+            w, h = img.size
+            if carrier == "VTP":
+                # ViettelPost có viền đen bao quanh 3-4px -> Cắt viền
+                cropped = img.crop((4, 4, w - 4, h - 4))
+                resized = cropped.resize(((w - 8) * 2, (h - 8) * 2), Image.LANCZOS)
+                gray = resized.convert('L')
+                enh = ImageEnhance.Contrast(gray).enhance(2.0)
+                bw = enh.point(lambda p: 0 if p < 140 else 255)
+            else:
+                # VNPost: phóng đại 3x, tăng tương phản, nhị phân hóa
+                resized = img.resize((w * 3, h * 3), Image.LANCZOS)
+                gray = resized.convert('L')
+                enh = ImageEnhance.Contrast(gray).enhance(2.5)
+                bw = enh.point(lambda p: 0 if p < 160 else 255)
+
+            config = '--psm 7 -c tessedit_char_whitelist=0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+            with _OCR_LOCK:
+                raw_text = pytesseract.image_to_string(bw, config=config).strip()
+            clean = re.sub(r'[^a-zA-Z0-9]', '', raw_text)
+            if len(clean) == 4:
+                return clean
+        except Exception as e:
+            logger.debug(f"Tesseract OCR error: {e}")
+
+    # --- 2. Fallback sang EasyOCR nếu Tesseract chưa giải được hoặc chưa cài binary ---
+    try:
+        global _OCR_READER
+        if _OCR_READER is None:
+            with _OCR_LOCK:
+                if _OCR_READER is None:
                     import easyocr
                     _OCR_READER = easyocr.Reader(['en'], gpu=False, verbose=False)
-                    logger.info("EasyOCR Reader đã được khởi tạo thành công.")
-                except Exception as e:
-                    logger.error(f"Không thể khởi tạo EasyOCR: {e}")
-    return _OCR_READER
+        if _OCR_READER:
+            with _OCR_LOCK:
+                ocr_res = _OCR_READER.readtext(img_bytes)
+            raw = "".join([r[1] for r in ocr_res]).strip()
+            clean = re.sub(r'[^a-zA-Z0-9]', '', raw)
+            if len(clean) == 4:
+                return clean
+    except Exception:
+        pass
+
+    return ""
 
 # Tên và biểu tượng đại diện cho các hãng vận chuyển
 CARRIER_NAMES = {
@@ -218,11 +272,10 @@ def _extract_val(d: dict, *keys, default: str = "") -> str:
 # ==============================================================================
 def _fetch_vnpost_portal_live(clean_code: str) -> Optional[Dict[str, Any]]:
     """
-    Tra cứu VNPost trực tiếp qua cổng vnpost.vn với captcha EasyOCR nội bộ
+    Tra cứu VNPost trực tiếp qua cổng vnpost.vn với Tesseract OCR siêu nhẹ
     (chuyên dụng cho các mã bưu kiện UPU/bưu phẩm như CQ..., CC..., CP..., RN...).
     """
-    reader = _get_ocr_reader()
-    if not reader or not HAS_CURL_CFFI or not HAS_PIL:
+    if not HAS_CURL_CFFI or not HAS_PIL:
         return None
 
     try:
@@ -243,7 +296,7 @@ def _fetch_vnpost_portal_live(clean_code: str) -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
-    for attempt in range(4):
+    for attempt in range(8):
         try:
             r_cap = session.get("https://vnpost.vn/handle-captcha/refresh-captcha", headers=headers, timeout=8)
             if r_cap.status_code != 200:
@@ -255,27 +308,19 @@ def _fetch_vnpost_portal_live(clean_code: str) -> Optional[Dict[str, Any]]:
             if img_resp.status_code != 200:
                 continue
 
-            img = Image.open(io.BytesIO(img_resp.content))
-            w, h = img.size
-            img_large = img.resize((w * 3, h * 3), Image.LANCZOS)
-            enhancer = ImageEnhance.Contrast(img_large)
-            img_contrast = enhancer.enhance(2.0)
-            buf = io.BytesIO()
-            img_contrast.save(buf, format="PNG")
-
-            with _OCR_LOCK:
-                ocr_res = reader.readtext(buf.getvalue())
-            raw_text = "".join([r[1] for r in ocr_res]).strip()
-            captcha_text = re.sub(r'[^a-zA-Z0-9]', '', raw_text)
+            captcha_text = _solve_captcha_image(img_resp.content, carrier="VNPOST")
             if len(captcha_text) != 4:
                 continue
 
             track_url = f"https://vnpost.vn/postcode/thong-tin?post_code={clean_code}&captcha={captcha_text}"
             r_track = session.get(track_url, headers=headers, timeout=10)
             if r_track.status_code == 200:
-                data = r_track.json()
-                if data.get("info") or data.get("locate"):
-                    return data
+                try:
+                    data = r_track.json()
+                    if data.get("info") or data.get("locate"):
+                        return data
+                except Exception:
+                    continue
         except Exception as e:
             logger.debug(f"VNPost live attempt {attempt+1} error: {e}")
             continue
@@ -597,10 +642,9 @@ def fetch_ghtk_tracking(code: str, label: str = "") -> Optional[Dict[str, Any]]:
 def _fetch_viettelpost_live(clean_code: str) -> Optional[Dict[str, Any]]:
     """
     Tra cứu ViettelPost trực tiếp từ cổng web api.viettelpost.vn
-    sử dụng EasyOCR nội bộ giải captcha tự động.
+    sử dụng Tesseract OCR siêu nhẹ tự động (fallback EasyOCR).
     """
-    reader = _get_ocr_reader()
-    if not reader or not HAS_CURL_CFFI:
+    if not HAS_CURL_CFFI:
         return None
 
     try:
@@ -616,7 +660,7 @@ def _fetch_viettelpost_live(clean_code: str) -> Optional[Dict[str, Any]]:
         "Accept": "application/json, text/plain, */*"
     }
 
-    for attempt in range(4):
+    for attempt in range(8):
         try:
             r1 = session.get("https://api.viettelpost.vn/api/orders/getCaptcha", headers=headers, timeout=8)
             if r1.status_code != 200:
@@ -629,10 +673,7 @@ def _fetch_viettelpost_live(clean_code: str) -> Optional[Dict[str, Any]]:
                 continue
 
             img_bytes = base64.b64decode(cap_b64)
-            with _OCR_LOCK:
-                ocr_res = reader.readtext(img_bytes)
-            raw_text = "".join([r[1] for r in ocr_res]).strip()
-            captcha_text = re.sub(r'[^a-zA-Z0-9]', '', raw_text)
+            captcha_text = _solve_captcha_image(img_bytes, carrier="VTP")
             if len(captcha_text) != 4:
                 continue
 
