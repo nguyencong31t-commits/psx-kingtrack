@@ -113,7 +113,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "🚚 <b>XIN CHÀO! ĐÂY LÀ BOT THEO DÕI ĐƠN HÀNG SPX EXPRESS</b>\n\n"
         "✨ <b>Cách dùng cực kỳ đơn giản:</b>\n"
-        "👉 Bạn chỉ cần <b>gửi thẳng mã vận đơn</b> (ví dụ: <code>SPXVN045388374941</code>) hoặc kèm tên / ngày dự kiến (ví dụ: <code>SPXVN045388374941 Giày Nike 25/10</code>), bot sẽ tự động nhận diện và theo dõi ngay!\n\n"
+        "👉 Bạn chỉ cần <b>gửi thẳng mã vận đơn</b> (ví dụ: <code>SPXVN045388374941</code>) hoặc kèm tên / ngày dự kiến (ví dụ: <code>SPXVN045388374941 Giày Nike 25/10</code>).\n"
+        "👉 Có thể gửi <b>nhiều dòng trong cùng một tin nhắn</b> (mỗi dòng 1 mã kèm ghi chú), bot sẽ tự động thêm toàn bộ vào danh sách theo dõi!\n\n"
         "📌 <b>Danh sách lệnh:</b>\n"
         "🔹 /list - Xem danh sách đơn đang theo dõi & ngày dự kiến giao\n"
         "🔹 /untrack - Chọn đơn cần hủy theo dõi bằng nút bấm tiện lợi\n"
@@ -121,6 +122,43 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔔 <b>Cơ chế hoạt động:</b> Bot quét định kỳ từ máy chủ SPX. Ngay khi bưu kiện di chuyển qua kho mới, bạn sẽ nhận được thông báo ngay lập tức!"
     )
     await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML)
+
+def extract_tracking_items(text: str) -> list:
+    """
+    Trích xuất danh sách các (mã vận đơn, ghi chú) từ tin nhắn.
+    Hỗ trợ cả trường hợp gửi nhiều dòng hoặc nhiều mã trên cùng một tin nhắn.
+    Ví dụ:
+        SPXVN06586066640A 8kg-bs
+        SPXVN06694936904A 13kg-bs
+    """
+    items = []
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    for line in lines:
+        matches = list(SPX_REGEX.finditer(line))
+        if not matches:
+            continue
+        if len(matches) == 1:
+            m = matches[0]
+            code = m.group(1).upper()
+            before = line[:m.start()].strip()
+            after = line[m.end():].strip()
+            # Xóa các ký tự bullet point ở đầu dòng nếu có (VD: 1. , -, *, •)
+            if before and re.match(r'^([\-\*\•\+]|\d+[\.\)\:\-])\s*$', before):
+                before = ''
+            label = (before + " " + after).strip()
+            items.append((code, label))
+        else:
+            for m in matches:
+                code = m.group(1).upper()
+                items.append((code, ""))
+
+    seen = set()
+    unique = []
+    for c, lbl in items:
+        if c not in seen:
+            seen.add(c)
+            unique.append((c, lbl))
+    return unique
 
 async def process_tracking_request(update: Update, tracking_number: str, label: str):
     """Xử lý tra cứu và lưu đơn vào database."""
@@ -152,7 +190,10 @@ async def process_tracking_request(update: Update, tracking_number: str, label: 
             card += "\n\n🎉 ĐƠN HÀNG ĐÃ GIAO THÀNH CÔNG!\n✅ Đơn hàng đã hoàn tất nên bot không cần theo dõi nữa."
         else:
             card += "\n\n⚠️ ĐƠN HÀNG ĐÃ BỊ HỦY HOẶC CHUYỂN HOÀN!\n✅ Đơn hàng đã kết thúc nên bot không cần theo dõi nữa."
-        await status_msg.edit_text(card)
+        
+        btn_name = f"🔍 Xem full hành trình" + (f" ({label})" if label else "")
+        keyboard = [[InlineKeyboardButton(btn_name, callback_data=f"journey:{info['tracking_number']}")]]
+        await status_msg.edit_text(card, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
         return
 
     # Lưu vào CSDL cho các đơn đang trên đường vận chuyển
@@ -166,7 +207,106 @@ async def process_tracking_request(update: Update, tracking_number: str, label: 
     )
 
     card += "\n\n🔔 Bot đã bật tự động theo dõi cho đơn hàng này!"
-    await status_msg.edit_text(card)
+    btn_name = f"🔍 Xem full hành trình" + (f" ({label})" if label else "")
+    keyboard = [[InlineKeyboardButton(btn_name, callback_data=f"journey:{info['tracking_number']}")]]
+    await status_msg.edit_text(card, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+
+async def process_multiple_tracking_requests(update: Update, items: list):
+    """
+    Xử lý tra cứu và thêm nhiều đơn hàng cùng lúc khi người dùng gửi nhiều dòng.
+    Lưu từng đơn vào CSDL và hiển thị danh sách tổng kết kèm nút xem hành trình.
+    """
+    chat_id = update.effective_chat.id
+    total = len(items)
+    status_msg = await update.message.reply_text(
+        f"⏳ Đang kết nối máy chủ SPX tra cứu và thêm {total} đơn hàng vào danh sách...",
+        parse_mode=ParseMode.HTML
+    )
+
+    loop = asyncio.get_running_loop()
+    sem = asyncio.Semaphore(3)
+
+    async def fetch_one(code: str, lbl: str):
+        async with sem:
+            try:
+                info = await loop.run_in_executor(None, fetch_spx_tracking, code, lbl)
+                return (code, lbl, info)
+            except Exception as e:
+                logger.error(f"Lỗi tra cứu {code}: {e}")
+                return (code, lbl, None)
+
+    # Tra cứu song song tối đa 3 đơn cùng lúc để tăng tốc độ phản hồi
+    results = await asyncio.gather(*[fetch_one(c, l) for c, l in items])
+
+    lines = [
+        f"📋 <b>KẾT QUẢ THÊM {total} ĐƠN HÀNG VÀO THEO DÕI:</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    keyboard = []
+    added_count = 0
+
+    for idx, (code, lbl, info) in enumerate(results, 1):
+        code_escaped = html.escape(code)
+        lbl_escaped = html.escape(lbl)
+        label_part = f" ({lbl_escaped})" if lbl_escaped and lbl_escaped.lower() not in ("đơn hàng spx", "đơn spx", "none", "") else ""
+
+        if not info:
+            lines.append(
+                f"<b>{idx}.</b> <code>{code_escaped}</code>{label_part}\n"
+                f"   ❌ <i>Chưa có thông tin trên hệ thống SPX (vui lòng kiểm tra lại)</i>\n"
+            )
+            continue
+
+        latest_event = info.get("latest_event") or {}
+        edd = info.get("estimated_delivery", "")
+        edd_badge = f" <b>[Dự kiến: {html.escape(edd)}]</b>" if edd else ""
+        status_text = html.escape(translate_spx_status(info.get("latest_status") or ""))
+        t_str = format_timestamp(info.get("timestamp") or 0)
+
+        if info.get("is_completed"):
+            await remove_tracking(chat_id, info["tracking_number"])
+            if info.get("is_delivered"):
+                done_msg = "🎉 Đơn đã giao thành công (không cần theo dõi)"
+            else:
+                done_msg = "⚠️ Đơn đã hủy / chuyển hoàn (không cần theo dõi)"
+            lines.append(
+                f"<b>{idx}.</b> <code>{code_escaped}</code>{label_part}\n"
+                f"   📌 Trạng thái: {status_text}\n"
+                f"   {done_msg}\n"
+            )
+        else:
+            # Lưu đơn vào CSDL
+            await add_or_update_tracking(
+                chat_id=chat_id,
+                tracking_number=info["tracking_number"],
+                label=lbl,
+                status=info.get("latest_status", ""),
+                timestamp=info.get("timestamp", 0),
+                estimated_delivery=edd
+            )
+            added_count += 1
+            lines.append(
+                f"<b>{idx}.</b> <code>{code_escaped}</code>{edd_badge}{label_part}\n"
+                f"   📌 Trạng thái: {status_text}\n"
+                f"   🕒 Cập nhật: {t_str}\n"
+                f"   ✅ Đã bật tự động theo dõi\n"
+            )
+
+        btn_name = f"🔍 {code}" + (f" ({lbl[:8]}..)" if len(lbl) > 8 else f" ({lbl})" if lbl else "")
+        keyboard.append([InlineKeyboardButton(btn_name, callback_data=f"journey:{code}")])
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"<i>💡 Đã thêm <b>{added_count}/{total}</b> đơn vào danh sách theo dõi. Bấm vào nút bên dưới để xem full hành trình hoặc gõ /list để xem tất cả đơn.</i>")
+
+    full_text = "\n".join(lines)
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+    try:
+        await status_msg.edit_text(full_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.warning(f"Lỗi gửi HTML trong process_multiple_tracking_requests: {e}")
+        clean_text = re.sub(r'<[^>]+>', '', full_text).replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+        await status_msg.edit_text(clean_text, reply_markup=reply_markup)
 
 async def send_full_journey(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE, label: str = ""):
     """Tra cứu và gửi toàn bộ hành trình chi tiết của đơn hàng."""
@@ -262,8 +402,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Thêm nút bấm tương tác cho từng đơn: Bấm là ra full hành trình ngay!
             btn_name = f"🔍 {code}" + (f" ({lbl[:8]}..)" if len(lbl) > 8 else f" ({lbl})" if lbl else "")
             keyboard.append([
-                InlineKeyboardButton(btn_name, callback_data=f"journey:{code}"),
-                InlineKeyboardButton("🗑 Hủy", callback_data=f"untrack:{code}")
+                InlineKeyboardButton(btn_name, callback_data=f"journey:{code}")
             ])
 
         lines.append("<i>💡 Bấm thẳng vào nút trên hoặc link lệnh /check_... để xem full hành trình!</i>")
@@ -419,28 +558,30 @@ async def handle_quick_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Tự động nhận diện khi người dùng gửi tin nhắn chứa mã SPXVN...
-    kèm tên hoặc ngày giao dự kiến.
+    Tự động nhận diện khi người dùng gửi tin nhắn chứa 1 hoặc nhiều mã SPXVN...
+    Hỗ trợ gửi nhiều dòng trong cùng một tin nhắn (mỗi dòng 1 mã kèm ghi chú).
     """
     text = (update.message.text or "").strip()
 
-    # Nhận diện khi người dùng gửi tin nhắn chứa mã SPXVN...
-    match = SPX_REGEX.search(text)
-    if match:
-        tracking_number = match.group(1).upper()
-        remaining_text = text.replace(match.group(1), "").strip()
-        label = remaining_text if remaining_text else ""
-        await process_tracking_request(update, tracking_number, label)
-    else:
+    items = extract_tracking_items(text)
+    if not items:
         # Nếu gửi tin nhắn thường không khớp mã SPX
         await update.message.reply_text(
             "💡 <b>HƯỚNG DẪN NHANH:</b>\n\n"
             "• Gửi thẳng mã vận đơn (VD: <code>SPXVN045388374941 Quần Jean 25/10</code>) để theo dõi tự động.\n"
+            "• Có thể gửi <b>nhiều dòng cùng lúc</b> (mỗi dòng 1 mã kèm ghi chú) để thêm toàn bộ vào danh sách!\n"
             "• Gõ lệnh /list để xem danh sách đơn & ngày dự kiến giao.\n"
             "• Gõ lệnh /untrack để chọn hủy theo dõi đơn hàng bằng nút bấm.\n"
             "• Gõ lệnh /help để xem chi tiết cú pháp.",
             parse_mode=ParseMode.HTML
         )
+        return
+
+    if len(items) == 1:
+        tracking_number, label = items[0]
+        await process_tracking_request(update, tracking_number, label)
+    else:
+        await process_multiple_tracking_requests(update, items)
 
 # ================= BACKGROUND POLLING JOB ================= #
 async def poll_spx_updates_job(context: ContextTypes.DEFAULT_TYPE):
