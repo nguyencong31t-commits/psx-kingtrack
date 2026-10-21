@@ -87,11 +87,12 @@ def translate_spx_status(raw_status: str, msg: str = "", loc: str = "") -> str:
         or "out for delivery" in full_lower
         or "out_for_delivery" in status_lower
         or "đang được giao" in full_lower
+        or "đang được đi giao" in full_lower
         or "đang giao hàng" in full_lower
         or "đang đi giao" in full_lower
         or "đang giao" in full_lower
     ):
-        return "Đơn hàng đang được giao đến bạn"
+        return "Đơn hàng đang được đi giao"
 
     # 3. ĐÃ HỦY / CHUYỂN HOÀN
     if (
@@ -143,7 +144,13 @@ def estimate_delivery_date(history: list, latest_status: str, label: str = "") -
             return m.group(1)
 
     st_lower = (latest_status or "").lower()
-    if "đang được giao" in st_lower or "delivering" in st_lower or "out for delivery" in st_lower:
+    if (
+        "đang được đi giao" in st_lower
+        or "đang được giao" in st_lower
+        or "đang đi giao" in st_lower
+        or "delivering" in st_lower
+        or "out for delivery" in st_lower
+    ):
         return "Hôm nay"
 
     for ev in reversed(history or []):
@@ -353,6 +360,7 @@ def fetch_spx_tracking(tracking_number: str, label: str = "") -> Optional[Dict[s
         or "out for delivery" in full_text
         or "out_for_delivery" in status_lower
         or "đang được giao" in full_text
+        or "đang được đi giao" in full_text
         or "đang giao" in full_text
         or "đang đi giao" in full_text
     )

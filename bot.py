@@ -242,7 +242,6 @@ async def process_multiple_tracking_requests(update: Update, items: list):
         f"📋 <b>KẾT QUẢ THÊM {total} ĐƠN HÀNG VÀO THEO DÕI:</b>",
         "━━━━━━━━━━━━━━━━━━━━━━",
     ]
-    keyboard = []
     added_count = 0
 
     for idx, (code, lbl, info) in enumerate(results, 1):
@@ -290,23 +289,20 @@ async def process_multiple_tracking_requests(update: Update, items: list):
                 f"   📌 Trạng thái: {status_text}\n"
                 f"   🕒 Cập nhật: {t_str}\n"
                 f"   ✅ Đã bật tự động theo dõi\n"
+                f"   👉 Xem hành trình: /check_{code}\n"
             )
 
-        btn_name = f"🔍 {code}" + (f" ({lbl[:8]}..)" if len(lbl) > 8 else f" ({lbl})" if lbl else "")
-        keyboard.append([InlineKeyboardButton(btn_name, callback_data=f"journey:{code}")])
-
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"<i>💡 Đã thêm <b>{added_count}/{total}</b> đơn vào danh sách theo dõi. Bấm vào nút bên dưới để xem full hành trình hoặc gõ /list để xem tất cả đơn.</i>")
+    lines.append(f"<i>✅ Đã thêm <b>{added_count}/{total}</b> đơn vào danh sách theo dõi. Bấm link /check_... trên từng đơn để xem chi tiết hành trình.</i>")
 
     full_text = "\n".join(lines)
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
 
     try:
-        await status_msg.edit_text(full_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        await status_msg.edit_text(full_text, parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.warning(f"Lỗi gửi HTML trong process_multiple_tracking_requests: {e}")
         clean_text = re.sub(r'<[^>]+>', '', full_text).replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
-        await status_msg.edit_text(clean_text, reply_markup=reply_markup)
+        await status_msg.edit_text(clean_text)
 
 async def send_full_journey(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE, label: str = ""):
     """Tra cứu và gửi toàn bộ hành trình chi tiết của đơn hàng."""
@@ -393,7 +389,6 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = await asyncio.gather(*[fetch_one(r) for r in rows])
 
         lines = [f"📋 <b>DANH SÁCH ĐƠN ĐANG THEO DÕI ({len(rows)} đơn):</b>\n"]
-        keyboard = []
 
         for idx, (r, info) in enumerate(results, 1):
             code = r["tracking_number"]
@@ -448,22 +443,14 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"   👉 Xem hành trình: /check_{code}\n"
                 )
 
-            # Thêm nút bấm tương tác cho từng đơn: Bấm là ra full hành trình ngay!
-            btn_name = f"🔍 {code}" + (f" ({lbl[:8]}..)" if len(lbl) > 8 else f" ({lbl})" if lbl else "")
-            keyboard.append([
-                InlineKeyboardButton(btn_name, callback_data=f"journey:{code}")
-            ])
-
-        lines.append("<i>💡 Bấm thẳng vào nút trên hoặc link lệnh /check_... để xem full hành trình!</i>")
         full_text = "\n".join(lines)
-        reply_markup = InlineKeyboardMarkup(keyboard)
 
         try:
-            await status_msg.edit_text(full_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+            await status_msg.edit_text(full_text, parse_mode=ParseMode.HTML)
         except Exception as send_err:
             logger.warning(f"Lỗi gửi HTML trong /list ({send_err}), fallback sang text thường")
             clean_text = re.sub(r'<[^>]+>', '', full_text).replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
-            await status_msg.edit_text(clean_text, reply_markup=reply_markup)
+            await status_msg.edit_text(clean_text)
     except Exception as e:
         logger.error(f"Lỗi list_command: {e}", exc_info=True)
         await update.message.reply_text("⚠️ Có lỗi xảy ra khi lấy danh sách đơn. Vui lòng thử lại sau!")
