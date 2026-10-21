@@ -371,6 +371,18 @@ def fetch_spx_tracking(tracking_number: str, label: str = "") -> Optional[Dict[s
         location = latest_event.get("location") or latest_event.get("hub_name", "")
         detail_msg = latest_event.get("message") or latest_event.get("description", "")
         
+        # Tự động trích xuất địa điểm kho từ message nếu trường location chưa có
+        if not location and detail_msg:
+            m_at = re.search(r'at \[(.*?)\]', detail_msg, re.IGNORECASE)
+            m_to = re.search(r'transporting to \[(.*?)\]', detail_msg, re.IGNORECASE)
+            m_b = re.search(r'^\[(.*?)\]', detail_msg)
+            if m_at:
+                location = m_at.group(1)
+            elif m_to:
+                location = f"Đang chuyển đến {m_to.group(1)}"
+            elif m_b and not m_b.group(1).startswith("TO"):
+                location = m_b.group(1)
+        
     status_lower = (status_title or "").lower()
     full_text = f"{status_title} {detail_msg}".lower()
 

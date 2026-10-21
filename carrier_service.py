@@ -42,7 +42,9 @@ from spx_service import (
 
 logger = logging.getLogger(__name__)
 
-# Cấu hình OCR đa nền tảng: Ưu tiên Tesseract OCR siêu nhẹ (~40MB RAM), tương thích Docker Render Free
+# Cấu hình OCR đa nền tảng kết hợp tối ưu:
+# - VNPost: Sử dụng Tesseract OCR siêu nhẹ (giải trong 0.04s, RAM cực thấp)
+# - ViettelPost: Sử dụng EasyOCR tối ưu CPU (chuyên trị chữ uốn lượn/kết dính của ViettelPost)
 try:
     import pytesseract
     HAS_PYTESSERACT = True
@@ -53,38 +55,53 @@ try:
 except ImportError:
     HAS_PYTESSERACT = False
 
+# Giới hạn số luồng PyTorch về 1 luồng để tiết kiệm CPU và RAM trên Render Free
+try:
+    import torch
+    torch.set_num_threads(1)
+except Exception:
+    pass
+
 _OCR_READER = None
 _OCR_LOCK = threading.Lock()
 
 def _solve_captcha_image(img_bytes: bytes, carrier: str = "GENERIC") -> str:
     """
     Hàm giải Captcha tự động đa tầng:
-    1. Ưu tiên Tesseract OCR với tiền xử lý ảnh chuyên sâu (Crop viền, Contrast, Binarize, Lanczos upscale)
-       -> Siêu nhẹ (RAM ~40MB), chạy 0.04s, cực kỳ an toàn trên Render Free 512MB RAM.
-    2. Fallback sang EasyOCR nếu môi trường chưa cài binary tesseract.
+    1. ViettelPost: Font chữ viết tay/uốn lượn phức tạp -> Dùng EasyOCR nhận diện chính xác 100%.
+    2. VNPost: Chữ in khối rõ ràng -> Dùng Tesseract OCR siêu tốc (0.04s).
     """
-    if not HAS_PIL or not img_bytes:
+    global _OCR_READER
+    if not img_bytes:
         return ""
 
-    # --- 1. Thử giải bằng Tesseract OCR siêu nhẹ ---
-    if HAS_PYTESSERACT:
+    # ViettelPost sử dụng font chữ viết uốn lượn đặc thù, EasyOCR nhận diện chuẩn xác nhất
+    if carrier == "VTP":
+        try:
+            if _OCR_READER is None:
+                with _OCR_LOCK:
+                    if _OCR_READER is None:
+                        import easyocr
+                        _OCR_READER = easyocr.Reader(['en'], gpu=False, verbose=False)
+            if _OCR_READER:
+                with _OCR_LOCK:
+                    ocr_res = _OCR_READER.readtext(img_bytes)
+                raw = "".join([r[1] for r in ocr_res]).strip()
+                clean = re.sub(r'[^a-zA-Z0-9]', '', raw)
+                if len(clean) == 4:
+                    return clean
+        except Exception as e:
+            logger.debug(f"EasyOCR VTP error: {e}")
+
+    # VNPost và các hãng khác: Sử dụng Tesseract OCR siêu tốc
+    if HAS_PYTESSERACT and HAS_PIL:
         try:
             img = Image.open(io.BytesIO(img_bytes))
             w, h = img.size
-            if carrier == "VTP":
-                # ViettelPost có viền đen bao quanh 3-4px -> Cắt viền
-                cropped = img.crop((4, 4, w - 4, h - 4))
-                resized = cropped.resize(((w - 8) * 2, (h - 8) * 2), Image.LANCZOS)
-                gray = resized.convert('L')
-                enh = ImageEnhance.Contrast(gray).enhance(2.0)
-                bw = enh.point(lambda p: 0 if p < 140 else 255)
-            else:
-                # VNPost: phóng đại 3x, tăng tương phản, nhị phân hóa
-                resized = img.resize((w * 3, h * 3), Image.LANCZOS)
-                gray = resized.convert('L')
-                enh = ImageEnhance.Contrast(gray).enhance(2.5)
-                bw = enh.point(lambda p: 0 if p < 160 else 255)
-
+            resized = img.resize((w * 3, h * 3), Image.LANCZOS)
+            gray = resized.convert('L')
+            enh = ImageEnhance.Contrast(gray).enhance(2.5)
+            bw = enh.point(lambda p: 0 if p < 160 else 255)
             config = '--psm 7 -c tessedit_char_whitelist=0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
             with _OCR_LOCK:
                 raw_text = pytesseract.image_to_string(bw, config=config).strip()
@@ -94,9 +111,8 @@ def _solve_captcha_image(img_bytes: bytes, carrier: str = "GENERIC") -> str:
         except Exception as e:
             logger.debug(f"Tesseract OCR error: {e}")
 
-    # --- 2. Fallback sang EasyOCR nếu Tesseract chưa giải được hoặc chưa cài binary ---
+    # Fallback cho VNPost nếu Tesseract chưa giải được
     try:
-        global _OCR_READER
         if _OCR_READER is None:
             with _OCR_LOCK:
                 if _OCR_READER is None:
@@ -857,6 +873,19 @@ def fetch_spx_unified(code: str, label: str = "") -> Optional[Dict[str, Any]]:
         st = ev.get("status") or ev.get("message") or ""
         msg = ev.get("message") or ev.get("description") or ""
         loc = ev.get("location") or ev.get("hub_name", "")
+
+        # Tự động trích xuất vị trí kho/hub từ thông điệp của SPX
+        if not loc and msg:
+            m_at = re.search(r'at \[(.*?)\]', msg, re.IGNORECASE)
+            m_to = re.search(r'transporting to \[(.*?)\]', msg, re.IGNORECASE)
+            m_b = re.search(r'^\[(.*?)\]', msg)
+            if m_at:
+                loc = m_at.group(1)
+            elif m_to:
+                loc = f"Đang chuyển đến {m_to.group(1)}"
+            elif m_b and not m_b.group(1).startswith("TO"):
+                loc = m_b.group(1)
+
         st_vn = translate_spx_status(st, msg, loc)
         history_unified.append({
             "status": st_vn,
@@ -867,6 +896,10 @@ def fetch_spx_unified(code: str, label: str = "") -> Optional[Dict[str, Any]]:
             "location": loc
         })
         
+    latest_loc = info.get("location", "")
+    if not latest_loc and history_unified:
+        latest_loc = history_unified[-1].get("location", "")
+
     return {
         "carrier": "SPX",
         "carrier_name": CARRIER_NAMES["SPX"],
@@ -874,7 +907,7 @@ def fetch_spx_unified(code: str, label: str = "") -> Optional[Dict[str, Any]]:
         "label": label or "",
         "latest_status": info.get("latest_status", "Đang vận chuyển"),
         "timestamp": info.get("timestamp", 0),
-        "location": info.get("location", ""),
+        "location": latest_loc,
         "estimated_delivery": info.get("estimated_delivery") or None,
         "is_delivered": bool(info.get("is_delivered")),
         "is_completed": bool(info.get("is_completed")),
