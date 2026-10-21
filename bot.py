@@ -15,7 +15,6 @@ from dotenv import load_dotenv
 from telegram import (
     Update, 
     BotCommand, 
-    ForceReply, 
     InlineKeyboardMarkup, 
     InlineKeyboardButton
 )
@@ -42,7 +41,8 @@ from spx_service import (
     format_timestamp, 
     format_spx_card, 
     format_full_journey,
-    translate_spx_status
+    translate_spx_status,
+    estimate_delivery_date
 )
 
 # Tải biến môi trường
@@ -111,17 +111,16 @@ def start_health_check_server():
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lệnh /start."""
     welcome_text = (
-        "🚚 *XIN CHÀO! ĐÂY LÀ BOT THEO DÕI ĐƠN HÀNG SPX EXPRESS*\n\n"
-        "✨ *Cách dùng cực kỳ tiện lợi:*\n"
-        "👉 Bạn chỉ cần **gửi trực tiếp mã vận đơn** (ví dụ: `SPXVN045388374941`) hoặc kèm tên gợi nhớ (ví dụ: `SPXVN045388374941 Giày Nike`), bot sẽ tự động nhận diện và bật chế độ theo dõi ngay lập tức!\n\n"
-        "📌 *Danh sách lệnh:*\n"
-        "🔹 `/list` - Xem các đơn hàng đang theo dõi\n"
-        "🔹 `/untrack <mã>` - Hủy theo dõi một đơn hàng\n"
-        "🔹 `/check <mã>` - Tra cứu tức thì 1 lần (không lưu)\n"
-        "🔹 `/help` - Xem lại hướng dẫn\n\n"
-        "🔔 *Cơ chế hoạt động:* Bot sẽ định kỳ quét hành trình từ máy chủ SPX. Ngay khi bưu kiện di chuyển qua kho mới, bạn sẽ nhận được tin nhắn báo ngay lập tức!"
+        "🚚 <b>XIN CHÀO! ĐÂY LÀ BOT THEO DÕI ĐƠN HÀNG SPX EXPRESS</b>\n\n"
+        "✨ <b>Cách dùng cực kỳ đơn giản:</b>\n"
+        "👉 Bạn chỉ cần <b>gửi thẳng mã vận đơn</b> (ví dụ: <code>SPXVN045388374941</code>) hoặc kèm tên / ngày dự kiến (ví dụ: <code>SPXVN045388374941 Giày Nike 25/10</code>), bot sẽ tự động nhận diện và theo dõi ngay!\n\n"
+        "📌 <b>Danh sách lệnh:</b>\n"
+        "🔹 /list - Xem danh sách đơn đang theo dõi & ngày dự kiến giao\n"
+        "🔹 /untrack - Chọn đơn cần hủy theo dõi bằng nút bấm tiện lợi\n"
+        "🔹 /help - Xem lại hướng dẫn\n\n"
+        "🔔 <b>Cơ chế hoạt động:</b> Bot quét định kỳ từ máy chủ SPX. Ngay khi bưu kiện di chuyển qua kho mới, bạn sẽ nhận được thông báo ngay lập tức!"
     )
-    await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(welcome_text, parse_mode=ParseMode.HTML)
 
 async def process_tracking_request(update: Update, tracking_number: str, label: str):
     """Xử lý tra cứu và lưu đơn vào database."""
@@ -130,20 +129,21 @@ async def process_tracking_request(update: Update, tracking_number: str, label: 
 
     # Gọi API SPX trong worker thread để tránh block asyncio loop
     loop = asyncio.get_running_loop()
-    info = await loop.run_in_executor(None, fetch_spx_tracking, tracking_number)
+    info = await loop.run_in_executor(None, fetch_spx_tracking, tracking_number, label)
 
     if not info:
         await status_msg.edit_text(
-            f"❌ Không tìm thấy thông tin cho mã: `{tracking_number}`.\n\n"
-            "⚠️ *Gợi ý kiểm tra:*\n"
-            "1. Đảm bảo mã vận đơn chính xác (thường bắt đầu bằng `SPXVN...`).\n"
+            f"❌ Không tìm thấy thông tin cho mã: <code>{html.escape(tracking_number)}</code>.\n\n"
+            "⚠️ <b>Gợi ý kiểm tra:</b>\n"
+            "1. Đảm bảo mã vận đơn chính xác (thường bắt đầu bằng <code>SPXVN...</code>).\n"
             "2. Nếu đơn vừa mới đặt trên Shopee, bưu cục có thể chưa kịp nhập dữ liệu lên hệ thống SPX.",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.HTML
         )
         return
 
     latest_event = info.get("latest_event") or {}
-    card = format_spx_card(info["tracking_number"], label, latest_event)
+    edd = info.get("estimated_delivery", "")
+    card = format_spx_card(info["tracking_number"], label, latest_event, edd)
 
     # Nếu đơn hàng đã giao thành công hoặc đã hủy: Không lưu vào theo dõi (tự động untrack)
     if info.get("is_completed"):
@@ -161,7 +161,8 @@ async def process_tracking_request(update: Update, tracking_number: str, label: 
         tracking_number=info["tracking_number"],
         label=label,
         status=info["latest_status"],
-        timestamp=info["timestamp"]
+        timestamp=info["timestamp"],
+        estimated_delivery=edd
     )
 
     card += "\n\n🔔 Bot đã bật tự động theo dõi cho đơn hàng này!"
@@ -175,7 +176,7 @@ async def send_full_journey(chat_id: int, code: str, context: ContextTypes.DEFAU
         parse_mode=ParseMode.HTML
     )
     loop = asyncio.get_running_loop()
-    info = await loop.run_in_executor(None, fetch_spx_tracking, code)
+    info = await loop.run_in_executor(None, fetch_spx_tracking, code, label)
 
     if not info:
         await status_msg.edit_text(f"❌ Không tìm thấy thông tin cho mã: <code>{html.escape(code)}</code>.", parse_mode=ParseMode.HTML)
@@ -190,36 +191,32 @@ async def send_full_journey(chat_id: int, code: str, context: ContextTypes.DEFAU
         await status_msg.edit_text(clean)
 
 async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lệnh /track [mã] [tên_gợi_nhớ]: Đăng ký theo dõi đơn hàng tự động."""
-    if not context.args:
+    """Hỗ trợ nếu người dùng quen tay gõ /track."""
+    if context.args:
+        tracking_number = context.args[0].strip().upper()
+        label = " ".join(context.args[1:]).strip() if len(context.args) > 1 else ""
+        await process_tracking_request(update, tracking_number, label)
+    else:
         await update.message.reply_text(
-            "➕ <b>THEO DÕI ĐƠN HÀNG TỰ ĐỘNG</b>\n\n"
-            "👇 <i>Dán mã SPXVN... (kèm tên gợi nhớ nếu có) vào đây:</i>",
-            reply_markup=ForceReply(selective=True, input_field_placeholder="Ví dụ: SPXVN06479385806A Áo thun"),
+            "💡 <b>MẸO TIỆN LỢI:</b> Bạn không cần gõ lệnh <code>/track</code> nữa!\n\n"
+            "👉 Hãy gửi thẳng mã vận đơn vào khung chat (VD: <code>SPXVN06479385806A Áo thun</code>), bot sẽ tự động nhận diện và theo dõi ngay lập tức.",
             parse_mode=ParseMode.HTML
         )
-        return
-
-    tracking_number = context.args[0].strip().upper()
-    label = " ".join(context.args[1:]).strip() if len(context.args) > 1 else ""
-    await process_tracking_request(update, tracking_number, label)
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lệnh /check [mã]: Tra cứu toàn bộ hành trình chi tiết."""
-    if not context.args:
+    """Hỗ trợ nếu người dùng quen tay gõ /check."""
+    if context.args:
+        code = context.args[0].strip().upper()
+        await send_full_journey(update.effective_chat.id, code, context)
+    else:
         await update.message.reply_text(
-            "🔍 <b>TRA CỨU TOÀN BỘ HÀNH TRÌNH</b>\n\n"
-            "👇 <i>Dán mã SPXVN... cần tra cứu vào đây:</i>",
-            reply_markup=ForceReply(selective=True, input_field_placeholder="Dán mã SPXVN... vào đây"),
+            "💡 <b>MẸO TIỆN LỢI:</b> Bạn không cần gõ lệnh <code>/check</code> nữa!\n\n"
+            "👉 Hãy gõ lệnh /list rồi bấm vào nút xem hành trình của từng đơn là xem được toàn bộ nhé.",
             parse_mode=ParseMode.HTML
         )
-        return
-
-    code = context.args[0].strip().upper()
-    await send_full_journey(update.effective_chat.id, code, context)
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lệnh /list liệt kê các đơn đang chờ giao kèm nút bấm xem hành trình."""
+    """Lệnh /list liệt kê các đơn đang chờ giao kèm ngày dự kiến và nút bấm xem hành trình."""
     try:
         chat_id = update.effective_chat.id
         rows = await get_active_trackings_by_chat(chat_id)
@@ -244,8 +241,19 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_text = html.escape(translate_spx_status(r["last_status"] or ""))
             code_escaped = html.escape(code)
             
+            # Ngày dự kiến giao ngay cạnh mã vận đơn
+            edd = ""
+            try:
+                edd = r["estimated_delivery"] or ""
+            except Exception:
+                pass
+            if not edd:
+                edd = estimate_delivery_date([], r["last_status"], lbl)
+            
+            edd_badge = f" <b>[Dự kiến: {html.escape(edd)}]</b>" if edd else ""
+            
             lines.append(
-                f"<b>{idx}.</b> <code>{code_escaped}</code>{label_part}\n"
+                f"<b>{idx}.</b> <code>{code_escaped}</code>{edd_badge}{label_part}\n"
                 f"   📌 Trạng thái: {status_text}\n"
                 f"   🕒 Cập nhật: {t_str}\n"
                 f"   👉 Xem hành trình: /check_{code}\n"
@@ -411,43 +419,12 @@ async def handle_quick_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Xử lý tin nhắn văn bản:
-    1. Trả lời từ ForceReply (khi gõ /check, /track, /untrack mà không kèm mã)
-    2. Bấm vào lệnh nhanh dạng /check_SPXVN...
-    3. Gửi trực tiếp mã SPXVN... để tra cứu & theo dõi
+    Tự động nhận diện khi người dùng gửi tin nhắn chứa mã SPXVN...
+    kèm tên hoặc ngày giao dự kiến.
     """
-    text = update.message.text.strip()
-    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
 
-    # 1. Kiểm tra nếu tin nhắn là trả lời cho một ô chờ ForceReply
-    reply = update.message.reply_to_message
-    if reply and reply.text:
-        prompt_text = reply.text.upper()
-        if "TRA CỨU TOÀN BỘ HÀNH TRÌNH" in prompt_text or "TRA CỨU" in prompt_text:
-            match = SPX_REGEX.search(text)
-            code = match.group(1).upper() if match else text.split()[0].upper()
-            await send_full_journey(chat_id, code, context)
-            return
-        elif "HỦY THEO DÕI" in prompt_text:
-            match = SPX_REGEX.search(text)
-            code = match.group(1).upper() if match else text.split()[0].upper()
-            success = await remove_tracking(chat_id, code)
-            code_escaped = html.escape(code)
-            if success:
-                await update.message.reply_text(f"🗑 Đã dừng theo dõi đơn <code>{code_escaped}</code> thành công.", parse_mode=ParseMode.HTML)
-            else:
-                await update.message.reply_text(f"❓ Không tìm thấy mã <code>{code_escaped}</code> trong danh sách theo dõi của bạn.", parse_mode=ParseMode.HTML)
-            return
-        elif "THEO DÕI ĐƠN HÀNG" in prompt_text:
-            match = SPX_REGEX.search(text)
-            if match:
-                tracking_number = match.group(1).upper()
-                remaining_text = text.replace(match.group(1), "").strip()
-                label = remaining_text if remaining_text else ""
-                await process_tracking_request(update, tracking_number, label)
-                return
-
-    # 2. Tự động nhận diện khi người dùng gửi tin nhắn chứa mã SPXVN...
+    # Nhận diện khi người dùng gửi tin nhắn chứa mã SPXVN...
     match = SPX_REGEX.search(text)
     if match:
         tracking_number = match.group(1).upper()
@@ -457,10 +434,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         # Nếu gửi tin nhắn thường không khớp mã SPX
         await update.message.reply_text(
-            "💡 <b>HƯỚNG DẪN:</b>\n\n"
-            "• Gửi thẳng mã vận đơn (VD: <code>SPXVN045388374941 Quần Jean</code>) để theo dõi tự động.\n"
-            "• Gõ lệnh /check để tra cứu toàn bộ hành trình.\n"
-            "• Gõ lệnh /list để xem danh sách đơn đang theo dõi.\n"
+            "💡 <b>HƯỚNG DẪN NHANH:</b>\n\n"
+            "• Gửi thẳng mã vận đơn (VD: <code>SPXVN045388374941 Quần Jean 25/10</code>) để theo dõi tự động.\n"
+            "• Gõ lệnh /list để xem danh sách đơn & ngày dự kiến giao.\n"
+            "• Gõ lệnh /untrack để chọn hủy theo dõi đơn hàng bằng nút bấm.\n"
             "• Gõ lệnh /help để xem chi tiết cú pháp.",
             parse_mode=ParseMode.HTML
         )
@@ -487,17 +464,18 @@ async def poll_spx_updates_job(context: ContextTypes.DEFAULT_TYPE):
         label = row["label"]
         last_time = row["last_timestamp"]
 
-        info = await loop.run_in_executor(None, fetch_spx_tracking, code)
+        info = await loop.run_in_executor(None, fetch_spx_tracking, code, label)
         if not info:
             continue
 
         is_done = bool(info.get("is_completed"))
         has_new_event = info.get("timestamp", 0) > last_time
+        edd = info.get("estimated_delivery", "")
 
         # Phát hiện sự kiện mới (timestamp mới hơn mốc đã lưu)
         if has_new_event:
             latest_event = info.get("latest_event") or {}
-            card = format_spx_card(code, label, latest_event)
+            card = format_spx_card(code, label, latest_event, edd)
 
             if is_done:
                 if info.get("is_delivered"):
@@ -520,7 +498,8 @@ async def poll_spx_updates_job(context: ContextTypes.DEFAULT_TYPE):
                     tracking_id=order_id,
                     status=info["latest_status"],
                     timestamp=info["timestamp"],
-                    is_completed=0
+                    is_completed=0,
+                    estimated_delivery=edd
                 )
         elif is_done:
             # Đơn đã giao thành công từ trước: tự động dọn dẹp untrack khỏi CSDL
@@ -531,17 +510,15 @@ async def poll_spx_updates_job(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(2.0)
 
 async def post_init(application: Application):
-    """Tự động đăng ký danh sách menu lệnh với Telegram."""
+    """Tự động đăng ký danh sách menu lệnh rút gọn với Telegram."""
     commands = [
         BotCommand("start", "Bắt đầu & hướng dẫn sử dụng"),
-        BotCommand("list", "Xem danh sách đơn đang theo dõi"),
-        BotCommand("check", "Kiểm tra nhanh tình trạng đơn"),
-        BotCommand("track", "Theo dõi đơn: /track SPXVN..."),
-        BotCommand("untrack", "Hủy theo dõi đơn: /untrack SPXVN..."),
+        BotCommand("list", "Xem danh sách đơn & ngày dự kiến giao"),
+        BotCommand("untrack", "Chọn đơn cần hủy theo dõi"),
         BotCommand("help", "Xem trợ giúp & cú pháp"),
     ]
     await application.bot.set_my_commands(commands)
-    logger.info("Đã tự động đăng ký danh sách menu lệnh với Telegram thành công!")
+    logger.info("Đã tự động đăng ký danh sách menu lệnh rút gọn với Telegram thành công!")
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Bắt và log toàn bộ exception chưa được xử lý để tránh bot bị câm lặng."""

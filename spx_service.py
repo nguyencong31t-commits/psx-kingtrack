@@ -128,7 +128,48 @@ def translate_spx_status(raw_status: str, msg: str = "", loc: str = "") -> str:
 
     return msg or raw_status
 
-def format_spx_card(tracking_number: str, label: str, event: dict) -> str:
+def estimate_delivery_date(history: list, latest_status: str, label: str = "") -> str:
+    """
+    Ước tính ngày giao hàng:
+    1. Ưu tiên nếu người dùng có ghi ngày trong tên gợi nhớ (VD: 25/10, 25-10, giao 25/10).
+    2. Nếu shipper đang giao (Delivering): "Hôm nay".
+    3. Nếu đã đến kho phát (LMHub_Received): "Hôm nay - Ngày mai".
+    4. Nếu đã lấy hàng (Pickup): lấy mốc lấy hàng + 3 ngày (thời gian chuẩn của SPX).
+    5. Nếu chỉ mới tạo đơn (Created): lấy mốc tạo đơn + 4 ngày.
+    """
+    if label:
+        m = re.search(r'\b(\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\b', label)
+        if m:
+            return m.group(1)
+
+    st_lower = (latest_status or "").lower()
+    if "đang được giao" in st_lower or "delivering" in st_lower or "out for delivery" in st_lower:
+        return "Hôm nay"
+
+    for ev in reversed(history or []):
+        st = (ev.get("status") or "").lower()
+        if "lmhub_received" in st or "đến kho giao" in st:
+            return "Hôm nay - Ngày mai"
+
+    for ev in (history or []):
+        st = (ev.get("status") or "").lower()
+        if "pickup_done" in st or "picked up" in st or "lấy hàng thành công" in st:
+            ts = ev.get("timestamp") or ev.get("checkpoint_time", 0)
+            if ts:
+                edd = datetime.fromtimestamp(ts + 3 * 86400, tz=VN_TZ)
+                return f"~{edd.strftime('%d/%m')}"
+
+    for ev in (history or []):
+        st = (ev.get("status") or "").lower()
+        if "created" in st or "khởi tạo" in st:
+            ts = ev.get("timestamp") or ev.get("checkpoint_time", 0)
+            if ts:
+                edd = datetime.fromtimestamp(ts + 4 * 86400, tz=VN_TZ)
+                return f"~{edd.strftime('%d/%m')}"
+
+    return ""
+
+def format_spx_card(tracking_number: str, label: str, event: dict, estimated_delivery: str = "") -> str:
     """
     Định dạng thông báo chuẩn theo mẫu EXPRESS VN TRACK BOT:
     🔔 SPX Update: ...
@@ -136,6 +177,7 @@ def format_spx_card(tracking_number: str, label: str, event: dict) -> str:
     📦 Mã (Tên)
     📌 Status: ...
     🕒 Date: ...
+    📅 Dự kiến: ... (nếu có)
     📍 Location: ...
     🚚 Next Location: ...
     """
@@ -184,6 +226,8 @@ def format_spx_card(tracking_number: str, label: str, event: dict) -> str:
         f"📌 Status: {status_vn}",
         f"🕒 Date: {date_str}"
     ]
+    if estimated_delivery and status_vn != "Đơn hàng đã giao thành công":
+        lines.append(f"📅 Dự kiến giao: {estimated_delivery}")
     if loc:
         lines.append(f"📍 Location: {loc}")
     if next_loc:
@@ -246,7 +290,7 @@ def format_full_journey(info: dict, label: str = "") -> str:
 
     return "\n".join(lines)
 
-def fetch_spx_tracking(tracking_number: str) -> Optional[Dict[str, Any]]:
+def fetch_spx_tracking(tracking_number: str, label: str = "") -> Optional[Dict[str, Any]]:
     """Tra cứu hành trình kiện hàng từ SPX Express Việt Nam với chữ ký số."""
     clean_code = tracking_number.strip().upper()
     signed_code = generate_signed_tracking_number(clean_code)
@@ -338,6 +382,8 @@ def fetch_spx_tracking(tracking_number: str) -> Optional[Dict[str, Any]]:
         or "trả hàng thành công" in full_text
     )
     
+    edd = estimate_delivery_date(sorted_history, status_title, label)
+    
     return {
         "tracking_number": data.get("sls_tracking_number", clean_code),
         "latest_status": translate_spx_status(status_title, detail_msg, location),
@@ -345,6 +391,7 @@ def fetch_spx_tracking(tracking_number: str) -> Optional[Dict[str, Any]]:
         "detail_message": detail_msg,
         "location": location,
         "timestamp": checkpoint_time,
+        "estimated_delivery": edd,
         "is_completed": 1 if (is_delivered or is_cancelled) else 0,
         "is_delivered": is_delivered,
         "is_cancelled": is_cancelled,
