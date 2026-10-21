@@ -95,7 +95,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     <div class="card">
         <div class="badge">SYSTEM ONLINE</div>
         <h2>Multi-Carrier Telegram Tracking Bot</h2>
-        <p style="color: #94a3b8;">Bot is actively running and polling orders (SPX, VNPost, GHTK, ViettelPost).</p>
+        <p style="color: #94a3b8;">Bot is actively running and polling orders (SPX, VNPost, GHTK).</p>
     </div>
 </body>
 </html>"""
@@ -118,11 +118,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lệnh /start."""
     welcome_text = (
         "🚚 <b>XIN CHÀO! ĐÂY LÀ BOT THEO DÕI ĐƠN HÀNG ĐA HÃNG</b>\n\n"
-        "✨ <b>Hỗ trợ tra cứu & tự động thông báo 4 hãng phổ biến:</b>\n"
+        "✨ <b>Hỗ trợ tra cứu & tự động thông báo 3 hãng:</b>\n"
         "🔹 <b>SPX Express</b> (Ví dụ: <code>SPXVN06694936904A</code>)\n"
         "🔹 <b>VNPost / EMS</b> (Ví dụ: <code>EB123456789VN</code>)\n"
-        "🔹 <b>Giao Hàng Tiết Kiệm - GHTK</b> (Ví dụ: <code>S22784532</code>)\n"
-        "🔹 <b>ViettelPost</b> (Ví dụ: <code>VT123456789</code> hoặc 10-12 số)\n\n"
+        "🔹 <b>Giao Hàng Tiết Kiệm - GHTK</b> (Ví dụ: <code>S22784532</code>)\n\n"
+        "<i>(Lưu ý: ViettelPost hiện không hỗ trợ)</i>\n\n"
         "✨ <b>Cách dùng cực kỳ đơn giản:</b>\n"
         "👉 Bạn chỉ cần <b>gửi thẳng mã vận đơn</b> hoặc kèm tên / ghi chú (ví dụ: <code>SPXVN06694936904A Quần Jean</code>).\n"
         "👉 Có thể gửi <b>nhiều dòng trong cùng một tin nhắn</b> (mỗi dòng 1 mã kèm ghi chú), bot sẽ tự động thêm toàn bộ vào danh sách theo dõi!\n\n"
@@ -177,13 +177,28 @@ async def process_tracking_request(update: Update, tracking_number: str, label: 
     """Xử lý tra cứu và lưu đơn đa hãng vào database."""
     chat_id = update.effective_chat.id
     carrier = detect_carrier(tracking_number)
+
+    # Nếu là ViettelPost: thông báo ngay không hỗ trợ và không lưu vào DB
+    if carrier == "VTP":
+        await update.message.reply_text(
+            f"❌ <b>Đơn hàng của vtpost không hỗ trợ.</b>\n📦 Mã đơn: <code>{html.escape(tracking_number)}</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
     carrier_name = CARRIER_NAMES.get(carrier, "Vận chuyển")
     status_msg = await update.message.reply_text(f"⏳ Đang kết nối máy chủ {carrier_name} tra cứu hành trình...")
 
     loop = asyncio.get_running_loop()
     info = await loop.run_in_executor(None, fetch_tracking_unified, tracking_number, label, carrier)
 
-    if not info:
+    if not info or info.get("unsupported") or info.get("carrier") == "VTP":
+        if info and (info.get("unsupported") or info.get("carrier") == "VTP"):
+            await status_msg.edit_text(
+                f"❌ <b>Đơn hàng của vtpost không hỗ trợ.</b>\n📦 Mã đơn: <code>{html.escape(tracking_number)}</code>",
+                parse_mode=ParseMode.HTML
+            )
+            return
         await status_msg.edit_text(
             f"❌ Không tìm thấy thông tin cho mã: <code>{html.escape(tracking_number)}</code> trên hệ thống {carrier_name}.\n\n"
             "⚠️ <b>Gợi ý kiểm tra:</b>\n"
@@ -244,8 +259,10 @@ async def process_multiple_tracking_requests(update: Update, items: list):
     sem = asyncio.Semaphore(4)
 
     async def fetch_one(code: str, lbl: str):
+        carrier = detect_carrier(code)
+        if carrier == "VTP":
+            return (code, lbl, {"carrier": "VTP", "unsupported": True, "latest_status": "Đơn hàng của vtpost không hỗ trợ"}, carrier)
         async with sem:
-            carrier = detect_carrier(code)
             try:
                 info = await loop.run_in_executor(None, fetch_tracking_unified, code, lbl, carrier)
                 return (code, lbl, info, carrier)
@@ -267,6 +284,13 @@ async def process_multiple_tracking_requests(update: Update, items: list):
         label_part = f" ({lbl_escaped})" if lbl_escaped and lbl_escaped.lower() not in ("đơn hàng", "đơn", "none", "", "spx", "ghtk", "vtp", "ems") else ""
         carrier_name = CARRIER_NAMES.get(carrier_detected, "Vận chuyển")
         carrier_badge = f"[{carrier_name}] "
+
+        if carrier_detected == "VTP" or (info and (info.get("unsupported") or info.get("carrier") == "VTP")):
+            lines.append(
+                f"<b>{idx}.</b> [ViettelPost] <code>{code_escaped}</code>{label_part}\n"
+                f"   ❌ <i>Đơn hàng của vtpost không hỗ trợ</i>\n"
+            )
+            continue
 
         if not info:
             lines.append(
@@ -327,6 +351,14 @@ async def process_multiple_tracking_requests(update: Update, items: list):
 async def send_full_journey(chat_id: int, code: str, context: ContextTypes.DEFAULT_TYPE, label: str = ""):
     """Tra cứu và gửi toàn bộ hành trình chi tiết của đơn hàng (đa hãng)."""
     carrier = detect_carrier(code)
+    if carrier == "VTP":
+        await context.bot.send_message(
+            chat_id=chat_id, 
+            text=f"❌ <b>Đơn hàng của vtpost không hỗ trợ.</b>\n📦 Mã đơn: <code>{html.escape(code)}</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
     carrier_name = CARRIER_NAMES.get(carrier, "Vận chuyển")
     status_msg = await context.bot.send_message(
         chat_id=chat_id, 
@@ -336,7 +368,13 @@ async def send_full_journey(chat_id: int, code: str, context: ContextTypes.DEFAU
     loop = asyncio.get_running_loop()
     info = await loop.run_in_executor(None, fetch_tracking_unified, code, label, carrier)
 
-    if not info:
+    if not info or info.get("unsupported") or info.get("carrier") == "VTP":
+        if info and (info.get("unsupported") or info.get("carrier") == "VTP"):
+            await status_msg.edit_text(
+                f"❌ <b>Đơn hàng của vtpost không hỗ trợ.</b>\n📦 Mã đơn: <code>{html.escape(code)}</code>",
+                parse_mode=ParseMode.HTML
+            )
+            return
         await status_msg.edit_text(
             f"❌ Không tìm thấy thông tin cho mã: <code>{html.escape(code)}</code> trên hệ thống {carrier_name}.",
             parse_mode=ParseMode.HTML
@@ -385,7 +423,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows:
             await update.message.reply_text(
                 "📭 Hiện tại bạn không có đơn hàng nào đang theo dõi.\n"
-                "👉 Hãy gửi mã vận đơn (SPX, VNPost/EMS, GHTK, ViettelPost) để thêm đơn nhé!",
+                "👉 Hãy gửi mã vận đơn (SPX, VNPost/EMS, GHTK) để thêm đơn nhé!",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -402,6 +440,8 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c = r["tracking_number"]
             l = r["label"] or ""
             carrier = r.get("carrier") or detect_carrier(c)
+            if carrier == "VTP":
+                return (r, {"carrier": "VTP", "unsupported": True})
             async with sem:
                 try:
                     info = await loop.run_in_executor(None, fetch_tracking_unified, c, l, carrier)
@@ -422,6 +462,10 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label_part = f" ({lbl_escaped})" if lbl_escaped and lbl_escaped.lower() not in ("đơn hàng", "đơn", "none", "", "spx", "ghtk", "vtp", "ems") else ""
 
             carrier = r.get("carrier") or detect_carrier(code)
+            if carrier == "VTP" or (info and info.get("unsupported")):
+                await remove_tracking(chat_id, code)
+                continue
+
             if info:
                 carrier = info.get("carrier", carrier)
                 carrier_name = info.get("carrier_name") or CARRIER_NAMES.get(carrier, "Vận chuyển")
@@ -637,7 +681,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(
             "💡 <b>HƯỚNG DẪN NHANH:</b>\n\n"
             "• Gửi thẳng mã vận đơn (VD: <code>SPXVN06694936904A Quần Jean</code> hoặc <code>EB123456789VN</code>) để theo dõi tự động.\n"
-            "• Hỗ trợ đa hãng: <b>SPX Express, VNPost / EMS, GHTK, ViettelPost</b>.\n"
+            "• Hỗ trợ: <b>SPX Express, VNPost / EMS, GHTK</b> (ViettelPost không hỗ trợ).\n"
             "• Có thể gửi <b>nhiều dòng cùng lúc</b> (mỗi dòng 1 mã kèm ghi chú) để thêm toàn bộ vào danh sách!\n"
             "• Gõ lệnh /list để xem danh sách đơn & ngày dự kiến giao.\n"
             "• Gõ lệnh /untrack để chọn hủy theo dõi đơn hàng bằng nút bấm.\n"
@@ -674,9 +718,15 @@ async def poll_spx_updates_job(context: ContextTypes.DEFAULT_TYPE):
         label = row["label"]
         last_time = row["last_timestamp"]
         carrier = row.get("carrier") or detect_carrier(code)
+        if carrier == "VTP":
+            await remove_tracking(chat_id, code)
+            logger.info(f"Đã tự động dọn dẹp đơn ViettelPost không hỗ trợ: {code} (chat_id: {chat_id})")
+            continue
 
         info = await loop.run_in_executor(None, fetch_tracking_unified, code, label, carrier)
-        if not info:
+        if not info or info.get("unsupported") or info.get("carrier") == "VTP":
+            if info and (info.get("unsupported") or info.get("carrier") == "VTP"):
+                await remove_tracking(chat_id, code)
             continue
 
         is_done = bool(info.get("is_completed"))
@@ -779,7 +829,7 @@ def main():
         first=15 # Quét lần đầu sau 15 giây kể từ khi bật bot
     )
 
-    print(f"\n🚀 Bot Đa Hãng Telegram (SPX, VNPost, GHTK, ViettelPost) đang chạy!")
+    print(f"\n🚀 Bot Đa Hãng Telegram (SPX, VNPost, GHTK) đang chạy!")
     print(f"⏱  Chu kỳ quét tự động: {POLL_INTERVAL_MINUTES} phút/lần.")
     print(f"👉 Mở Telegram và nhắn mã vận đơn cho bot để bắt đầu!\n")
 

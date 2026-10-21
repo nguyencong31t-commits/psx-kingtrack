@@ -42,9 +42,8 @@ from spx_service import (
 
 logger = logging.getLogger(__name__)
 
-# Cấu hình OCR đa nền tảng kết hợp tối ưu:
+# Cấu hình OCR siêu nhẹ:
 # - VNPost: Sử dụng Tesseract OCR siêu nhẹ (giải trong 0.04s, RAM cực thấp)
-# - ViettelPost: Sử dụng EasyOCR tối ưu CPU (chuyên trị chữ uốn lượn/kết dính của ViettelPost)
 try:
     import pytesseract
     HAS_PYTESSERACT = True
@@ -55,67 +54,11 @@ try:
 except ImportError:
     HAS_PYTESSERACT = False
 
-# Giới hạn số luồng PyTorch về 1 luồng để tiết kiệm CPU và RAM trên Render Free
-try:
-    import torch
-    torch.set_num_threads(1)
-except Exception:
-    pass
-
-_OCR_READER = None
-_OCR_LOCK = threading.Lock()
-
 def _solve_captcha_image(img_bytes: bytes, carrier: str = "GENERIC") -> str:
-    """
-    Hàm giải Captcha tự động đa tầng:
-    1. ViettelPost: Font chữ viết tay/uốn lượn phức tạp -> Dùng EasyOCR nhận diện chính xác 100%.
-    2. VNPost: Chữ in khối rõ ràng -> Dùng Tesseract OCR siêu tốc (0.04s).
-    """
-    global _OCR_READER
+    """Hàm giải Captcha tự động bằng Tesseract OCR siêu tốc (chuyên dụng cho VNPost)."""
     if not img_bytes:
         return ""
 
-    # ViettelPost sử dụng font chữ viết uốn lượn đặc thù, EasyOCR nhận diện chuẩn xác nhất
-    if carrier == "VTP":
-        try:
-            if _OCR_READER is None:
-                with _OCR_LOCK:
-                    if _OCR_READER is None:
-                        import easyocr
-                        _OCR_READER = easyocr.Reader(['en'], gpu=False, verbose=False)
-            if _OCR_READER:
-                # 1. Thử nhận diện sau khi crop bỏ đường gạch nhiễu bên trái (x: 35 đến 180)
-                try:
-                    if HAS_PIL:
-                        img = Image.open(io.BytesIO(img_bytes))
-                        w, h = img.size
-                        cropped = img.crop((35, 0, min(180, w), h))
-                        buf = io.BytesIO()
-                        cropped.save(buf, format='PNG')
-                        with _OCR_LOCK:
-                            c_res = _OCR_READER.readtext(buf.getvalue())
-                        raw_c = "".join([r[1] for r in c_res]).strip()
-                        clean_c = re.sub(r'[^a-zA-Z0-9]', '', raw_c).lower()
-                        if len(clean_c) == 4:
-                            return clean_c
-                        if len(clean_c) >= 5:
-                            return clean_c[-4:]
-                except Exception:
-                    pass
-
-                # 2. Thử ảnh gốc
-                with _OCR_LOCK:
-                    ocr_res = _OCR_READER.readtext(img_bytes)
-                raw = "".join([r[1] for r in ocr_res]).strip()
-                clean = re.sub(r'[^a-zA-Z0-9]', '', raw).lower()
-                if len(clean) == 4:
-                    return clean
-                if len(clean) >= 5:
-                    return clean[-4:]
-        except Exception as e:
-            logger.debug(f"EasyOCR VTP error: {e}")
-
-    # VNPost và các hãng khác: Sử dụng Tesseract OCR siêu tốc
     if HAS_PYTESSERACT and HAS_PIL:
         try:
             img = Image.open(io.BytesIO(img_bytes))
@@ -125,30 +68,12 @@ def _solve_captcha_image(img_bytes: bytes, carrier: str = "GENERIC") -> str:
             enh = ImageEnhance.Contrast(gray).enhance(2.5)
             bw = enh.point(lambda p: 0 if p < 160 else 255)
             config = '--psm 7 -c tessedit_char_whitelist=0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
-            with _OCR_LOCK:
-                raw_text = pytesseract.image_to_string(bw, config=config).strip()
+            raw_text = pytesseract.image_to_string(bw, config=config).strip()
             clean = re.sub(r'[^a-zA-Z0-9]', '', raw_text)
             if len(clean) == 4:
                 return clean
         except Exception as e:
             logger.debug(f"Tesseract OCR error: {e}")
-
-    # Fallback cho VNPost nếu Tesseract chưa giải được
-    try:
-        if _OCR_READER is None:
-            with _OCR_LOCK:
-                if _OCR_READER is None:
-                    import easyocr
-                    _OCR_READER = easyocr.Reader(['en'], gpu=False, verbose=False)
-        if _OCR_READER:
-            with _OCR_LOCK:
-                ocr_res = _OCR_READER.readtext(img_bytes)
-            raw = "".join([r[1] for r in ocr_res]).strip()
-            clean = re.sub(r'[^a-zA-Z0-9]', '', raw)
-            if len(clean) == 4:
-                return clean
-    except Exception:
-        pass
 
     return ""
 
@@ -688,245 +613,27 @@ def fetch_ghtk_tracking(code: str, label: str = "") -> Optional[Dict[str, Any]]:
     }
 
 # ==============================================================================
-# 3. TRA CỨU VIETTELPOST
+# 3. VIETTELPOST (HIỆN KHÔNG HỖ TRỢ THEO YÊU CẦU)
 # ==============================================================================
-def _fetch_viettelpost_live(clean_code: str) -> Optional[Dict[str, Any]]:
-    """
-    Tra cứu ViettelPost trực tiếp từ cổng web api.viettelpost.vn
-    sử dụng Tesseract OCR siêu nhẹ tự động (fallback EasyOCR).
-    """
-    if not HAS_CURL_CFFI:
-        return None
-
-    try:
-        session = cffi_requests.Session(impersonate="chrome124")
-    except Exception as e:
-        logger.error(f"Cannot initialize curl_cffi session for VTP: {e}")
-        return None
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Origin": "https://viettelpost.com.vn",
-        "Referer": "https://viettelpost.com.vn/",
-        "Accept": "application/json, text/plain, */*"
-    }
-
-    for attempt in range(8):
-        try:
-            r1 = session.get("https://api.viettelpost.vn/api/orders/getCaptcha", headers=headers, timeout=8)
-            if r1.status_code != 200:
-                logger.warning(f"VTP getCaptcha HTTP {r1.status_code}")
-                continue
-            res_cap = r1.json()
-            cap_data = res_cap.get("data") or {}
-            cap_id = cap_data.get("id")
-            cap_b64 = cap_data.get("captcha", "").split(",")[-1]
-            if not cap_id or not cap_b64:
-                continue
-
-            img_bytes = base64.b64decode(cap_b64)
-            captcha_text = _solve_captcha_image(img_bytes, carrier="VTP")
-            if len(captcha_text) != 4:
-                continue
-
-            payload = {"orders": clean_code, "id": cap_id, "captcha": captcha_text}
-            r2 = session.post(
-                "https://api.viettelpost.vn/api/orders/viewTrackingOrders",
-                headers=headers,
-                json=payload,
-                timeout=10
-            )
-            if r2.status_code == 200:
-                res_json = r2.json()
-                if res_json.get("error") is False and res_json.get("data"):
-                    items = res_json["data"]
-                    if items and isinstance(items, list):
-                        return items[0]
-                else:
-                    logger.debug(f"VTP attempt {attempt+1} verify failed: {res_json.get('message')}")
-            else:
-                logger.warning(f"VTP viewTrackingOrders HTTP {r2.status_code}")
-        except Exception as e:
-            logger.debug(f"VTP live attempt {attempt+1} error: {e}")
-            continue
-
-    return None
-
-_VTP_AUTO_TOKEN = None
-_VTP_TOKEN_LOCK = threading.Lock()
-
-def _get_vtp_token() -> str:
-    """Lấy token xác thực ViettelPost từ VTP_TOKEN hoặc tự động đăng nhập qua VTP_USERNAME / VTP_PASSWORD."""
-    global _VTP_AUTO_TOKEN
-    direct_token = os.getenv("VTP_TOKEN", "").strip()
-    if direct_token:
-        return direct_token
-
-    username = os.getenv("VTP_USERNAME", "").strip()
-    password = os.getenv("VTP_PASSWORD", "").strip()
-    if not username or not password:
-        return ""
-
-    with _VTP_TOKEN_LOCK:
-        if _VTP_AUTO_TOKEN:
-            return _VTP_AUTO_TOKEN
-        try:
-            login_url = "https://partner.viettelpost.vn/v2/user/Login"
-            headers = {"Content-Type": "application/json", "Accept": "application/json"}
-            payload = json.dumps({"USERNAME": username, "PASSWORD": password}).encode("utf-8")
-            import urllib.request
-            req = urllib.request.Request(login_url, data=payload, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    token = data.get("data", {}).get("token") or data.get("token") or ""
-                    if token:
-                        _VTP_AUTO_TOKEN = token
-                        logger.info("✅ Đã tự động đăng nhập và lấy Token ViettelPost Partner API thành công!")
-                        return token
-        except Exception as e:
-            logger.warning(f"Không thể tự động đăng nhập ViettelPost: {e}")
-
-    return ""
-
 def fetch_viettelpost_tracking(code: str, label: str = "") -> Dict[str, Any]:
-    """
-    Tra cứu vận đơn ViettelPost:
-    1. Ưu tiên Partner API nếu có VTP_TOKEN hoặc VTP_USERNAME/VTP_PASSWORD (0% CPU, siêu tốc, không bị WAF/Cloudflare).
-    2. Nếu không có token -> Tra cứu trực tiếp live qua api.viettelpost.vn giải captcha EasyOCR cắt viền nhiễu tự động.
-    3. Fallback nếu cả 2 phương thức đều không lấy được dữ liệu.
-    """
-    clean_code = code.strip().upper()
-
-    # 1. Thử gọi Partner API nếu có Token hoặc tài khoản đối tác
-    vtp_token = _get_vtp_token()
-    if vtp_token:
-        try:
-            api_url = f"https://partner.viettelpost.vn/v2/order/getOrderByBill?billCode={clean_code}"
-            headers = {
-                "Token": vtp_token,
-                "Accept": "application/json",
-                "Content-Type": "application/json"
-            }
-            raw_text = _http_get(api_url, headers=headers, timeout=10)
-            if raw_text:
-                res_json = json.loads(raw_text)
-                if res_json.get("status") == 200 and res_json.get("data"):
-                    data = res_json["data"]
-                    st_name = _extract_val(data, "ORDER_STATUS_NAME", "STATUS_NAME", "STATUS", default="Đang vận chuyển")
-                    loc = _extract_val(data, "CURRENT_LOCATION", "POST_OFFICE", "LOCATION", default="")
-                    raw_history = data.get("LIST_STATUS") or data.get("ORDER_HISTORY") or []
-                    
-                    history = []
-                    for h_item in raw_history:
-                        if isinstance(h_item, dict):
-                            h_st = _extract_val(h_item, "STATUS_NAME", "STATUS")
-                            h_time = _extract_val(h_item, "DATE_TIME", "TIME", "STATUS_DATE")
-                            h_loc = _extract_val(h_item, "LOCATION", "POST_OFFICE")
-                            h_ts = parse_datetime_to_timestamp(h_time)
-                            history.append({
-                                "status": h_st,
-                                "time": format_timestamp(h_ts) if h_ts else h_time,
-                                "timestamp": h_ts,
-                                "location": h_loc,
-                                "message": h_st
-                            })
-                    history.sort(key=lambda x: x.get("timestamp") or 0)
-                    
-                    st_lower = st_name.lower()
-                    is_delivered = any(w in st_lower for w in ["giao thành công", "đã giao", "ký nhận", "phát thành công"])
-                    is_cancelled = any(w in st_lower for w in ["hủy", "chuyển hoàn", "trả hàng"])
-                    
-                    return {
-                        "carrier": "VTP",
-                        "carrier_name": CARRIER_NAMES["VTP"],
-                        "tracking_number": clean_code,
-                        "label": label or "",
-                        "latest_status": st_name,
-                        "timestamp": history[-1]["timestamp"] if history else int(time.time()),
-                        "location": loc,
-                        "estimated_delivery": None,
-                        "is_delivered": is_delivered,
-                        "is_completed": is_delivered or is_cancelled,
-                        "is_cancelled": is_cancelled,
-                        "history": history,
-                        "tracking_url": get_tracking_url(clean_code, "VTP"),
-                        "is_fallback": False
-                    }
-        except Exception as e:
-            logger.warning(f"Lỗi gọi ViettelPost Partner API: {e}")
-
-    # 2. Thử tra cứu live captcha giải tự động qua EasyOCR
-    live_data = _fetch_viettelpost_live(clean_code)
-    if live_data:
-        trackings = live_data.get("TRACKINGS") or []
-        history = []
-        for item in trackings:
-            if not isinstance(item, dict):
-                continue
-            h_st = item.get("ORDER_NOTE") or "Đang vận chuyển"
-            h_time = item.get("ORDER_STATUSDATE") or ""
-            h_loc = item.get("BUU_CUC") or ""
-            h_ts = parse_datetime_to_timestamp(h_time)
-            history.append({
-                "status": h_st,
-                "time": format_timestamp(h_ts) if h_ts else h_time,
-                "timestamp": h_ts,
-                "location": h_loc,
-                "message": h_st
-            })
-
-        history.sort(key=lambda x: x.get("timestamp") or 0)
-        latest_event = history[-1] if history else {}
-        latest_status = latest_event.get("status") or "Đang vận chuyển"
-        latest_time = latest_event.get("timestamp") or int(time.time())
-        latest_loc = latest_event.get("location") or live_data.get("BUUCUC_NHAN") or ""
-
-        st_lower = latest_status.lower()
-        is_delivered = any(w in st_lower for w in ["giao thành công", "đã giao", "ký nhận", "phát thành công", "đã phát"])
-        is_cancelled = any(w in st_lower for w in ["hủy", "chuyển hoàn", "trả hàng"])
-        is_completed = is_delivered or is_cancelled
-
-        edd = ""
-        if not is_completed and history:
-            first_ts = history[0].get("timestamp") or 0
-            if first_ts:
-                edd_dt = datetime.fromtimestamp(first_ts + 3 * 86400, tz=VN_TZ)
-                edd = f"~{edd_dt.strftime('%d/%m')}"
-
-        return {
-            "carrier": "VTP",
-            "carrier_name": CARRIER_NAMES["VTP"],
-            "tracking_number": clean_code,
-            "label": label or "",
-            "latest_status": latest_status,
-            "timestamp": latest_time,
-            "location": latest_loc,
-            "estimated_delivery": edd or None,
-            "is_delivered": is_delivered,
-            "is_completed": is_completed,
-            "is_cancelled": is_cancelled,
-            "history": history,
-            "tracking_url": get_tracking_url(clean_code, "VTP"),
-            "is_fallback": False
-        }
-
-    # 3. Fallback nếu không tra cứu được qua API
+    """ViettelPost hiện không được hỗ trợ theo cấu hình hệ thống."""
+    clean_code = (code or "").strip().upper()
     return {
         "carrier": "VTP",
         "carrier_name": CARRIER_NAMES["VTP"],
         "tracking_number": clean_code,
         "label": label or "",
-        "latest_status": "Đang cập nhật từ hệ thống ViettelPost",
+        "latest_status": "Đơn hàng của vtpost không hỗ trợ",
         "timestamp": int(time.time()),
         "location": "",
         "estimated_delivery": None,
         "is_delivered": False,
-        "is_completed": False,
+        "is_completed": True,
         "is_cancelled": False,
         "history": [],
         "tracking_url": "",
-        "is_fallback": True
+        "is_fallback": True,
+        "unsupported": True
     }
 
 # ==============================================================================
@@ -1043,6 +750,11 @@ def format_carrier_card(data: dict) -> str:
     🌐 Link tra cứu: ...
     """
     carrier = data.get("carrier", "SPX")
+    code = data.get("tracking_number", "")
+    
+    if carrier == "VTP" or data.get("unsupported"):
+        return f"❌ <b>Đơn hàng của vtpost không hỗ trợ.</b>\n📦 Mã đơn: <code>{html.escape(code)}</code>"
+
     carrier_name = data.get("carrier_name") or CARRIER_NAMES.get(carrier, "Vận chuyển")
     icon = CARRIER_ICONS.get(carrier, "📦")
     code = data.get("tracking_number", "")
@@ -1081,6 +793,11 @@ def format_carrier_card(data: dict) -> str:
 def format_carrier_journey(data: dict) -> str:
     """Định dạng toàn bộ lịch sử hành trình chi tiết (Full Journey Timeline)."""
     carrier = data.get("carrier", "SPX")
+    code = data.get("tracking_number", "")
+    
+    if carrier == "VTP" or data.get("unsupported"):
+        return f"❌ <b>Đơn hàng của vtpost không hỗ trợ.</b>\n📦 Mã đơn: <code>{html.escape(code)}</code>"
+
     carrier_name = data.get("carrier_name") or CARRIER_NAMES.get(carrier, "Vận chuyển")
     icon = CARRIER_ICONS.get(carrier, "📦")
     code = data.get("tracking_number", "")
