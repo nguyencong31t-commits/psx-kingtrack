@@ -503,17 +503,20 @@ def fetch_vnpost_tracking(code: str, label: str = "") -> Optional[Dict[str, Any]
     """
     clean_code = code.strip().upper()
     
-    # 1. Thử qua API myems.vn trước
-    api_url = f"https://api.myems.vn/TrackAndTraceItemCode?itemcode={clean_code}&language=1"
+    # 1. Thử qua API public EMS (https://api.myems.vn/TrackAndTraceItemCode)
+    # Lưu ý: Cổng EMS yêu cầu hậu tố 'EMS' (ví dụ: EB125966888VNEMS) để truy xuất dữ liệu
+    itemcode_param = clean_code if clean_code.endswith("EMS") else f"{clean_code}EMS"
+    api_url = f"https://api.myems.vn/TrackAndTraceItemCode?itemcode={itemcode_param}&language=0"
     headers = {
         "Accept": "application/json, text/plain, */*",
-        "Referer": "https://ems.com.vn/"
+        "Referer": "https://ems.com.vn/",
+        "Origin": "https://ems.com.vn"
     }
     raw_text = _http_get(api_url, headers=headers, timeout=10)
     if raw_text:
         try:
             data = json.loads(raw_text)
-            if isinstance(data, dict):
+            if isinstance(data, dict) and data.get("Code") == "00":
                 res = _parse_myems_data(clean_code, data, label)
                 if res:
                     return res
