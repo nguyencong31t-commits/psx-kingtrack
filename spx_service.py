@@ -306,6 +306,26 @@ def fetch_spx_tracking(tracking_number: str, label: str = "") -> Optional[Dict[s
         from curl_cffi import requests
         session = requests.Session(impersonate="chrome124")
         
+        # 1. Thử lấy ngày dự kiến giao thực tế chính xác (EDD) từ Open API của SPX
+        exact_edd = ""
+        open_url = f"https://spx.vn/shipment/order/open/order/get_order_info?spx_tn={clean_code}&language_code=vi"
+        try:
+            res_open = session.get(open_url, headers=HEADERS, timeout=8)
+            if res_open.status_code == 200:
+                open_json = res_open.json()
+                if open_json.get("retcode") == 0 and open_json.get("data"):
+                    open_data = open_json["data"]
+                    edd_info = open_data.get("edd_info") or {}
+                    min_ts = edd_info.get("edd_min")
+                    max_ts = edd_info.get("edd_max")
+                    if min_ts and max_ts:
+                        d_min = datetime.fromtimestamp(min_ts, tz=VN_TZ).strftime("%d/%m")
+                        d_max = datetime.fromtimestamp(max_ts, tz=VN_TZ).strftime("%d/%m")
+                        exact_edd = d_min if d_min == d_max else f"{d_min} - {d_max}"
+        except Exception as e:
+            logger.debug(f"Không lấy được open EDD cho {clean_code}: {e}")
+
+        # 2. Lấy hành trình chi tiết qua API Search
         params = {"sls_tracking_number": signed_code}
         res = session.get(SPX_API_URL, params=params, headers=HEADERS, timeout=12)
         
@@ -390,7 +410,7 @@ def fetch_spx_tracking(tracking_number: str, label: str = "") -> Optional[Dict[s
         or "trả hàng thành công" in full_text
     )
     
-    edd = estimate_delivery_date(sorted_history, status_title, label)
+    edd = exact_edd or estimate_delivery_date(sorted_history, status_title, label)
     
     return {
         "tracking_number": data.get("sls_tracking_number", clean_code),
